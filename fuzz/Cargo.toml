@@ -1,0 +1,58 @@
+[package]
+name = "ezdracad-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "PolyForm-Noncommercial-1.0.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+ezdracad-core = { path = "../crates/ezdracad-core" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "read_mpx"
+path = "fuzz_targets/read_mpx.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_basic2d"
+path = "fuzz_targets/read_basic2d.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_document"
+path = "fuzz_targets/read_document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scan_mpz"
+path = "fuzz_targets/scan_mpz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scan_contents"
+path = "fuzz_targets/scan_contents.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "read_mps"
+path = "fuzz_targets/read_mps.rs"
+test = false
+doc = false
+bench = false

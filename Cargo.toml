@@ -1,0 +1,20 @@
+[workspace]
+members = ["crates/ezdracad-core", "crates/ezdracad-python"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2021"
+rust-version = "1.83"
+authors = ["neka-nat <nekanat.stock@gmail.com>"]
+repository = "https://github.com/monozukuri-ai/ezdracad"
+license = "PolyForm-Noncommercial-1.0.0"
+
+[workspace.dependencies]
+cfb = "0.14.0"
+flate2 = { version = "1.1.9", default-features = false, features = ["miniz_oxide"] }
+pyo3 = { version = "0.29.0", features = ["abi3-py310"] }
+thiserror = "2.0"
+sha2 = "0.10"
+# cfb allows uuid 1.x, but uuid 1.21 raised its MSRV above Rust 1.83.
+uuid = ">=1, <1.21"

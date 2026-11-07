@@ -1,0 +1,20 @@
+[package]
+name = "ezdracad-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Python bindings for the ezdracad Rust inspection core"
+publish = false
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+ezdracad-core = { path = "../ezdracad-core" }
+pyo3.workspace = true

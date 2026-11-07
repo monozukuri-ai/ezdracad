@@ -1,0 +1,16 @@
+/.internal/
+__pycache__/
+.venv/
+/target/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+/dist/
+/.pytest_cache/
+/.ruff_cache/
+*.egg-info/
+/src/ezdracad/_core*.so
+/src/ezdracad/_core*.pyd
+/src/ezdracad/_core*.dll
+/src/ezdracad/_core*.dylib

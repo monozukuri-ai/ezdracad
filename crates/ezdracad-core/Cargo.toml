@@ -1,0 +1,20 @@
+[package]
+name = "ezdracad-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Rust foundation for DRA-CAD file inspection"
+readme = "README.md"
+keywords = ["cad", "dracad", "cfb", "parser"]
+categories = ["parser-implementations"]
+include = ["/src/**", "/README.md", "/LICENSE", "/THIRD_PARTY_NOTICES.txt"]
+
+[dependencies]
+cfb.workspace = true
+flate2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+sha2.workspace = true
