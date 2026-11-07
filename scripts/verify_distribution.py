@@ -189,7 +189,10 @@ def inspect_artifact(artifact, expected_version):
         ]:
             assert not name.startswith(forbidden) and f"/{forbidden}" not in name, name
     metadata = Parser().parsestr(text)
-    assert metadata.get_payload().rstrip() == (ROOT / "README.md").read_text().rstrip()
+    assert (
+        metadata.get_payload().rstrip().splitlines()
+        == (ROOT / "README.md").read_text(encoding="utf-8").rstrip().splitlines()
+    )
     assert metadata["Name"] == "ezdracad"
     assert (
         read_toml(ROOT / "Cargo.toml")["workspace"]["package"]["license"]

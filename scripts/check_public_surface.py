@@ -100,7 +100,9 @@ def check_document(path, *, root=ROOT):
         require(linked.exists(), f"broken link: {path}: {target}")
         public_name(linked.relative_to(root.resolve()).as_posix())
         if url.fragment and linked.is_file() and linked.suffix == ".md":
-            headings = re.findall(r"^#{1,6}\s+(.+)$", linked.read_text(), re.M)
+            headings = re.findall(
+                r"^#{1,6}\s+(.+)$", linked.read_text(encoding="utf-8"), re.M
+            )
             anchors = {
                 re.sub(r"[^\w -]", "", h.lower()).replace(" ", "-") for h in headings
             }

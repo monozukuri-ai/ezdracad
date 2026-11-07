@@ -57,6 +57,10 @@ exclude = [
     "fuzz/coverage/**",
 ]
 
+[tool.maturin.sbom]
+# Generated Rust SBOMs include absolute workspace paths.
+rust = false
+
 [tool.uv]
 cache-keys = [
     { file = "pyproject.toml" },

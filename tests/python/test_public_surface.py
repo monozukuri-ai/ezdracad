@@ -52,10 +52,12 @@ def test_document_language_links_and_private_references(tmp_path):
         "# Guide\n\n[missing](missing.md)\n",
         "# Guide\n\n[private](.internal/notes.md)\n",
     ):
-        document.write_text(value)
+        document.write_text(value, encoding="utf-8")
         with pytest.raises(ValueError):
             checker.check_document(document, root=tmp_path)
     document.write_text(
         "# Guide\n\n[section](#section)\n\n## Section\n\nEnglish prose.\n"
+        "\n```python\nlabel = '日本語'\n```\n",
+        encoding="utf-8",
     )
     assert checker.check_document(document, root=tmp_path) == 1
