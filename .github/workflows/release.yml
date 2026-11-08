@@ -1,0 +1,222 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate version and release tag
+    runs-on: ubuntu-24.04
+    outputs:
+      maturin-version: ${{ steps.tools.outputs.maturin-version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked --no-install-project
+      - name: Check versions, locks and tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          args=()
+          if [[ -n "$RELEASE_TAG" ]]; then
+            args=(--tag "$RELEASE_TAG")
+          fi
+          uv run --no-sync python scripts/bump_version.py --check "${args[@]}"
+          uv run --no-sync python scripts/check_public_surface.py
+      - name: Read the locked build tool version
+        id: tools
+        run: |
+          uv run --no-sync python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          lock = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))
+          version = next(p["version"] for p in lock["package"] if p["name"] == "maturin")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"maturin-version=v{version}\n")
+          PY
+
+  quality:
+    name: Run the complete CI suite
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  wheels:
+    name: Build and verify ${{ matrix.platform }} wheel
+    needs: [validate, quality]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, platform: linux-x86_64, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, platform: linux-aarch64, target: aarch64-unknown-linux-gnu }
+          - { os: macos-15-intel, platform: macos-x86_64, target: x86_64-apple-darwin }
+          - { os: macos-15, platform: macos-arm64, target: aarch64-apple-darwin }
+          - { os: windows-2022, platform: windows-x86_64, target: x86_64-pc-windows-msvc }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.10"
+      - run: uv sync --locked --no-install-project
+      - name: Build a portable Linux wheel
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          maturin-version: ${{ needs.validate.outputs.maturin-version }}
+          target: ${{ matrix.target }}
+          manylinux: "2_28"
+          args: --release --locked --interpreter python3.10 --out dist
+          before-script-linux: |
+            export RUSTFLAGS="--remap-path-prefix=$HOME=/build-cache --remap-path-prefix=$PWD=."
+      - name: Build a native wheel
+        if: runner.os != 'Linux'
+        run: uv run --no-sync python scripts/build_distributions.py --out dist
+      - name: Test the built wheel
+        run: |
+          uv pip install --python .venv --no-deps dist/*.whl
+          uv run --no-sync pytest
+          uv run --no-sync python scripts/verify_distribution.py dist/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-wheel-${{ matrix.platform }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  source:
+    name: Build and verify the source distribution
+    needs: quality
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.10"
+      - run: uv sync --locked --no-install-project
+      - run: uv run --no-sync maturin sdist --out dist
+      - name: Rebuild and test the source distribution in isolation
+        shell: bash
+        run: uv run --no-sync python scripts/verify_distribution.py dist/*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  prepare:
+    name: Collect verified release artifacts
+    needs: [wheels, source]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked --no-install-project
+      # Download only artifacts from the builds in this workflow run.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: candidate
+          merge-multiple: true
+      - run: uv run --no-sync python scripts/prepare_release.py collect candidate bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: publication-bundle
+          path: bundle/
+          if-no-files-found: error
+
+  pypi:
+    name: Publish to PyPI
+    needs: prepare
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/ezdracad
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked --no-install-project
+      - uses: actions/download-artifact@v4
+        with:
+          name: publication-bundle
+          path: bundle
+      - run: uv run --no-sync python scripts/prepare_release.py verify bundle
+      - name: Publish with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: bundle/dist/
+          attestations: true
+
+  github-release:
+    name: Publish GitHub Release
+    needs: pypi
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked --no-install-project
+      - uses: actions/download-artifact@v4
+        with:
+          name: publication-bundle
+          path: bundle
+      - run: uv run --no-sync python scripts/prepare_release.py verify bundle
+      - name: Attach distributions and checksums
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --json isDraft > release.json; then
+            python -c 'import json; assert json.load(open("release.json"))["isDraft"], "Release is already published"'
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --draft --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" bundle/dist/* bundle/SHA256SUMS --clobber
+          args=(--prerelease=false)
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            args=(--prerelease --latest=false)
+          fi
+          gh release edit "$GITHUB_REF_NAME" --draft=false "${args[@]}"
