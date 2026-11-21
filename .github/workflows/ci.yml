@@ -5,6 +5,12 @@ on:
   pull_request:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      source_ref:
+        description: Commit to qualify (defaults to the triggering commit)
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -14,6 +20,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -35,6 +43,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.83.0
       - uses: actions/setup-python@v5
         with:
@@ -45,6 +55,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Seed with synthetic layouts
@@ -93,6 +105,8 @@ jobs:
           - { os: windows-latest, python: "3.14" }
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v7
         with:

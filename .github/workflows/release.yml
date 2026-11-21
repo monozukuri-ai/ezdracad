@@ -4,12 +4,18 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag to publish (leave empty to validate only)
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -18,44 +24,62 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       maturin-version: ${{ steps.tools.outputs.maturin-version }}
+      source-sha: ${{ steps.tools.outputs.source-sha }}
+      release-tag: ${{ steps.tools.outputs.release-tag }}
+      prerelease: ${{ steps.tools.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
       - run: uv sync --locked --no-install-project
-      - name: Check versions, locks and tag
+      - name: Check versions and locks
         shell: bash
-        env:
-          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
-          args=()
-          if [[ -n "$RELEASE_TAG" ]]; then
-            args=(--tag "$RELEASE_TAG")
-          fi
-          uv run --no-sync python scripts/bump_version.py --check "${args[@]}"
+          uv run --no-sync python scripts/bump_version.py --check
           uv run --no-sync python scripts/check_public_surface.py
-      - name: Read the locked build tool version
+      - name: Validate release identity and read the locked build tool version
         id: tools
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
         run: |
           uv run --no-sync python - <<'PY'
           import os
+          import subprocess
+          import sys
           import tomllib
           from pathlib import Path
 
+          sys.path.insert(0, "scripts")
+          from bump_version import ROOT, check_versions, python_version
+          from packaging.version import Version
+
+          # Keep tag validation in the workflow so fixes can qualify older tags.
+          rust_version = check_versions(ROOT)
+          package_version = python_version(rust_version)
+          tag = os.environ["RELEASE_TAG"]
+          if tag and tag not in {f"v{rust_version}", f"v{package_version}"}:
+              raise SystemExit(f"Tag {tag!r} does not match {rust_version} / {package_version}")
+          sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           lock = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))
           version = next(p["version"] for p in lock["package"] if p["name"] == "maturin")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"maturin-version=v{version}\n")
+              output.write(f"source-sha={sha}\n")
+              output.write(f"release-tag={tag}\n")
+              output.write(f"prerelease={str(Version(package_version).is_prerelease).lower()}\n")
           PY
 
   quality:
     name: Run the complete CI suite
     needs: validate
     uses: ./.github/workflows/ci.yml
+    with:
+      source_ref: ${{ needs.validate.outputs.source-sha }}
 
   wheels:
     name: Build and verify ${{ matrix.platform }} wheel
@@ -76,6 +100,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.validate.outputs.source-sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v7
@@ -108,11 +133,12 @@ jobs:
 
   source:
     name: Build and verify the source distribution
-    needs: quality
+    needs: [validate, quality]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.validate.outputs.source-sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v7
@@ -131,11 +157,12 @@ jobs:
 
   prepare:
     name: Collect verified release artifacts
-    needs: [wheels, source]
+    needs: [validate, wheels, source]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.validate.outputs.source-sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
@@ -156,8 +183,8 @@ jobs:
 
   pypi:
     name: Publish to PyPI
-    needs: prepare
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [validate, prepare]
+    if: needs.validate.outputs.release-tag != '' && (github.event_name == 'push' || inputs.release_tag != '')
     runs-on: ubuntu-24.04
     environment:
       name: pypi
@@ -168,6 +195,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.validate.outputs.source-sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
@@ -186,14 +214,15 @@ jobs:
 
   github-release:
     name: Publish GitHub Release
-    needs: pypi
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [validate, pypi]
+    if: needs.validate.outputs.release-tag != '' && (github.event_name == 'push' || inputs.release_tag != '')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.validate.outputs.source-sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
@@ -208,15 +237,17 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release-tag }}
+          RELEASE_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" --json isDraft > release.json; then
+          if gh release view "$RELEASE_TAG" --json isDraft > release.json; then
             python -c 'import json; assert json.load(open("release.json"))["isDraft"], "Release is already published"'
           else
-            gh release create "$GITHUB_REF_NAME" --verify-tag --draft --generate-notes
+            gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes
           fi
-          gh release upload "$GITHUB_REF_NAME" bundle/dist/* bundle/SHA256SUMS --clobber
+          gh release upload "$RELEASE_TAG" bundle/dist/* bundle/SHA256SUMS --clobber
           args=(--prerelease=false)
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+          if [[ "$RELEASE_PRERELEASE" == true ]]; then
             args=(--prerelease --latest=false)
           fi
-          gh release edit "$GITHUB_REF_NAME" --draft=false "${args[@]}"
+          gh release edit "$RELEASE_TAG" --draft=false "${args[@]}"

@@ -65,10 +65,20 @@ on Python 3.10. The publication bundle contains these six distributions and
 `SHA256SUMS`; contents, metadata, license notices, and hashes are checked again
 before publication.
 
-Manual `workflow_dispatch` runs produce a verified `publication-bundle` artifact
-for review. A pushed `v<workspace.package.version>` tag publishes the same bundle
-to PyPI and attaches its distributions and checksums to a GitHub Release.
-Alpha, beta, and release-candidate tags create GitHub prereleases.
+Manual `workflow_dispatch` runs with an empty `release_tag` produce a verified
+`publication-bundle` artifact for review. A pushed version tag publishes the same
+bundle to PyPI and attaches its distributions and checksums to a GitHub Release.
+Tags accept either the Cargo or Python version spelling. Alpha, beta, and
+release-candidate versions create GitHub prereleases with either spelling.
+
+To retry an existing tag using the workflow on `main`, supply `release_tag`:
+
+```sh
+gh workflow run release.yml --ref main -f release_tag=v0.1.0a1
+```
+
+This publishes the selected tag after qualification. Its commit is resolved once
+and used for every build, check and upload; the existing tag is preserved.
 
 Before the first publication, configure a PyPI
 [Trusted Publisher](https://docs.pypi.org/trusted-publishers/adding-a-publisher/)
@@ -87,5 +97,5 @@ python scripts/bump_version.py X.Y.Z
 ```
 
 Supported prereleases include `X.Y.Z-alpha.1`, `X.Y.Z-beta.1`, and `X.Y.Z-rc.1`.
-For example, Cargo version `0.1.0-alpha.1` uses tag `v0.1.0-alpha.1` and Python
-package version `0.1.0a1`.
+For example, Cargo version `0.1.0-alpha.1` produces Python package version
+`0.1.0a1` and accepts either tag `v0.1.0-alpha.1` or `v0.1.0a1`.

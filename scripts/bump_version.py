@@ -62,8 +62,11 @@ def check_versions(root: Path, tag: str | None = None) -> str:
     # uv can omit the version for local projects with dynamic metadata.
     if local[0].get("version", expected_python) != expected_python:
         raise ValueError("uv.lock contains an outdated project version")
-    if tag is not None and tag != f"v{version}":
-        raise ValueError(f"tag {tag!r} does not match v{version}")
+    expected_tags = {f"v{version}", f"v{expected_python}"}
+    if tag is not None and tag not in expected_tags:
+        raise ValueError(
+            f"tag {tag!r} does not match {' or '.join(sorted(expected_tags))}"
+        )
     return version
 
 
@@ -103,7 +106,9 @@ def main() -> int:
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("version", nargs="?")
     action.add_argument("--check", action="store_true")
-    parser.add_argument("--tag", help="expected v<SemVer> tag; only with --check")
+    parser.add_argument(
+        "--tag", help="expected v<Cargo or Python version> tag; only with --check"
+    )
     args = parser.parse_args()
     if args.tag and not args.check:
         parser.error("--tag requires --check")
