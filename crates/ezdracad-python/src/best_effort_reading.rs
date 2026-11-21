@@ -48,6 +48,23 @@ fn table_row(row: &Bound<'_, PyDict>, table: Option<BestEffortTable>) -> PyResul
     }
 }
 
+fn fill_row<'py>(
+    py: Python<'py>,
+    fill: &Option<ezdracad_core::BestEffortFill>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    fill.as_ref()
+        .map(|fill| {
+            let row = PyDict::new(py);
+            row.set_item("color", fill.color)?;
+            // Numbers, not a byte string: a `Vec<u8>` would become `bytes`.
+            row.set_item("rgb", fill.rgb.map(u16::from).to_vec())?;
+            row.set_item("transparency", fill.transparency)?;
+            row.set_item("outline", fill.outline)?;
+            Ok(row)
+        })
+        .transpose()
+}
+
 fn geometry_row<'py>(
     py: Python<'py>,
     geometry: &BestEffortGeometry,
@@ -80,12 +97,12 @@ fn geometry_row<'py>(
             center,
             radius,
             elevation,
-            fill_state,
+            fill,
         } => {
             row.set_item("center", center)?;
             row.set_item("radius", radius)?;
             row.set_item("elevation", elevation)?;
-            row.set_item("fill_state", PyBytes::new(py, fill_state))?;
+            row.set_item("fill", fill_row(py, fill)?)?;
         }
         BestEffortGeometry::Arc {
             center,
@@ -104,10 +121,12 @@ fn geometry_row<'py>(
             center,
             radius,
             rotation_degrees,
+            fill,
         } => {
             row.set_item("center", center)?;
             row.set_item("radius", radius)?;
             row.set_item("rotation_degrees", rotation_degrees)?;
+            row.set_item("fill", fill_row(py, fill)?)?;
         }
         BestEffortGeometry::EllipticalArc {
             center,
@@ -147,6 +166,7 @@ fn geometry_row<'py>(
         BestEffortGeometry::Insert {
             name,
             name_bytes,
+            reference_number,
             position,
             elevation,
             scale,
@@ -154,6 +174,7 @@ fn geometry_row<'py>(
         } => {
             row.set_item("name", name)?;
             row.set_item("name_bytes", PyBytes::new(py, name_bytes))?;
+            row.set_item("reference_number", reference_number)?;
             row.set_item("position", position)?;
             row.set_item("elevation", elevation)?;
             row.set_item("scale", scale)?;
@@ -162,39 +183,39 @@ fn geometry_row<'py>(
         BestEffortGeometry::Polyline {
             curve_kind,
             flags_raw,
-            fill_color,
             divisions,
             three_d,
+            fill,
             curve_points,
         } => {
             row.set_item("curve_kind", curve_kind)?;
             row.set_item("flags", flags_raw)?;
             row.set_item("closed", flags_raw & 0x01 != 0)?;
-            row.set_item("filled", flags_raw & 0x04 != 0)?;
-            row.set_item("fill_color", fill_color)?;
             row.set_item("divisions", divisions)?;
             row.set_item("three_d", three_d)?;
+            row.set_item("fill", fill_row(py, fill)?)?;
             row.set_item("curve_points", curve_points.as_ref())?;
         }
         BestEffortGeometry::ExtendedPolygon {
             polygon_kind,
             flags_raw,
-            fill_color,
-            loop_count,
+            fill,
+            reference_number,
+            hole_count,
             link_id,
         } => {
             row.set_item("polygon_kind", polygon_kind)?;
             row.set_item("flags", flags_raw)?;
-            row.set_item("filled", flags_raw & 0x04 != 0)?;
-            row.set_item("fill_color", fill_color)?;
-            row.set_item("loop_count", loop_count)?;
+            row.set_item("fill", fill_row(py, fill)?)?;
+            row.set_item("reference_number", reference_number)?;
+            row.set_item("hole_count", hole_count)?;
             row.set_item("region_id", link_id)?;
         }
         BestEffortGeometry::Hatch {
             hatch_type,
             link_id,
             lines,
-            pattern_origin,
+            pattern,
         } => {
             row.set_item("hatch_type", hatch_type)?;
             row.set_item("region_id", link_id)?;
@@ -205,11 +226,26 @@ fn geometry_row<'py>(
                     value.set_item("origin", line.origin)?;
                     value.set_item("pitch", line.pitch)?;
                     value.set_item("angle_degrees", line.angle_degrees)?;
+                    value.set_item("color", line.color)?;
+                    value.set_item("line_type", line.line_type)?;
+                    value.set_item("width", line.width)?;
                     Ok(value)
                 })
                 .collect::<PyResult<_>>()?;
             row.set_item("lines", lines)?;
-            row.set_item("pattern_origin", pattern_origin)?;
+            match pattern {
+                Some(pattern) => {
+                    let value = PyDict::new(py);
+                    value.set_item("name", &pattern.name)?;
+                    value.set_item("origin", pattern.origin)?;
+                    value.set_item("values", pattern.values.clone())?;
+                    value.set_item("color", pattern.color)?;
+                    value.set_item("line_type", pattern.line_type)?;
+                    value.set_item("width", pattern.width)?;
+                    row.set_item("pattern", value)?;
+                }
+                None => row.set_item("pattern", py.None())?,
+            }
         }
         BestEffortGeometry::Dimension {
             dimension_type,
@@ -218,6 +254,7 @@ fn geometry_row<'py>(
             arrow_styles,
             text_position,
             line,
+            arc,
             extension_origins,
             arrow_sizes,
             arrow_paper_sizes,
@@ -225,12 +262,40 @@ fn geometry_row<'py>(
             row.set_item("dimension_type", dimension_type)?;
             row.set_item("flags", flags_raw)?;
             row.set_item("flags2", flags2_raw)?;
-            row.set_item("arrow_styles", arrow_styles.to_vec())?;
+            row.set_item("arrow_styles", arrow_styles.map(u16::from).to_vec())?;
             row.set_item("text_position", text_position)?;
             row.set_item("line", line)?;
+            match arc {
+                Some(arc) => {
+                    let value = PyDict::new(py);
+                    value.set_item("center", arc.center)?;
+                    value.set_item("radius", arc.radius)?;
+                    value.set_item("start_degrees", arc.start_degrees)?;
+                    value.set_item("end_degrees", arc.end_degrees)?;
+                    row.set_item("arc", value)?;
+                }
+                None => row.set_item("arc", py.None())?,
+            }
             row.set_item("extension_origins", extension_origins)?;
             row.set_item("arrow_sizes", arrow_sizes)?;
             row.set_item("arrow_paper_sizes", arrow_paper_sizes)?;
+        }
+        BestEffortGeometry::Leader {
+            leader_type,
+            flags_raw,
+            flags2_raw,
+            arrow_style,
+            lines,
+            arrow_size,
+            arrow_paper_size,
+        } => {
+            row.set_item("leader_type", leader_type)?;
+            row.set_item("flags", flags_raw)?;
+            row.set_item("flags2", flags2_raw)?;
+            row.set_item("arrow_style", arrow_style)?;
+            row.set_item("lines", lines)?;
+            row.set_item("arrow_size", arrow_size)?;
+            row.set_item("arrow_paper_size", arrow_paper_size)?;
         }
         BestEffortGeometry::Package {
             package_kind,
@@ -253,6 +318,40 @@ fn geometry_row<'py>(
             row.set_item("angle_degrees", angle_degrees)?;
             row.set_item("arrow_type", arrow_type)?;
             row.set_item("flags", flags_raw)?;
+        }
+        BestEffortGeometry::Image {
+            file_name,
+            directory,
+            position,
+            elevation,
+            scale,
+            size,
+            rotation_degrees,
+        } => {
+            row.set_item("file_name", file_name)?;
+            row.set_item("directory", directory)?;
+            row.set_item("position", position)?;
+            row.set_item("elevation", elevation)?;
+            row.set_item("scale", scale)?;
+            row.set_item("size", size)?;
+            row.set_item("rotation_degrees", rotation_degrees)?;
+        }
+        BestEffortGeometry::ExternalReference {
+            file_name,
+            directory,
+            relative_directory,
+            position,
+            elevation,
+            scale,
+            rotation_degrees,
+        } => {
+            row.set_item("file_name", file_name)?;
+            row.set_item("directory", directory)?;
+            row.set_item("relative_directory", relative_directory)?;
+            row.set_item("position", position)?;
+            row.set_item("elevation", elevation)?;
+            row.set_item("scale", scale)?;
+            row.set_item("rotation_degrees", rotation_degrees)?;
         }
     }
     Ok(row)

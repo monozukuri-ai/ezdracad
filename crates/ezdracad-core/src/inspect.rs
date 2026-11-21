@@ -15,6 +15,16 @@ use crate::{
 
 /// Identify a supported carrier and retain exact MPZ Contents or flat MPX bytes.
 pub fn inspect(data: &[u8], limits: &ParseLimits) -> Result<ContainerInfo> {
+    inspect_with(data, limits, false)
+}
+
+/// As [`inspect`]; with `unicode` set, the envelopes of the Unicode drawing
+/// format are decoded too and reported as [`DracadFormat::Mpuw`].
+pub(crate) fn inspect_with(
+    data: &[u8],
+    limits: &ParseLimits,
+    unicode: bool,
+) -> Result<ContainerInfo> {
     limits.check_file_size(data.len() as u64)?;
     if !data.starts_with(CFB_MAGIC) && data.starts_with(DRAWING_MAGIC) {
         // A real flat MPX is not MPZ Contents with a different filename. The
@@ -81,8 +91,14 @@ pub fn inspect(data: &[u8], limits: &ParseLimits) -> Result<ContainerInfo> {
         if bytes.len() as u64 != entry.size {
             return Err(invalid("SecureContents length differs from declared size"));
         }
-        if let Some((wrapper, decoded)) = crate::mps::decode(&bytes, entry.path.clone(), limits)? {
-            info.format = DracadFormat::Mps;
+        if let Some((wrapper, decoded)) =
+            crate::mps::decode_envelope(&bytes, entry.path.clone(), limits, unicode)?
+        {
+            info.format = if wrapper.wrapper_profile.starts_with("unprotected_unicode") {
+                DracadFormat::Mpuw
+            } else {
+                DracadFormat::Mps
+            };
             info.payload = Some(PayloadInfo {
                 domain: crate::PayloadOffsetDomain::DecodedPayload,
                 stream_path: None,

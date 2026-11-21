@@ -18,6 +18,7 @@ from . import _core
 from .options import ParseLimits
 
 __all__ = [
+    "BACKGROUND_FILL_COLOR",
     "BY_BLOCK_COLOR",
     "BY_BLOCK_LINE_TYPE",
     "BY_BLOCK_WIDTH",
@@ -32,6 +33,7 @@ __all__ = [
     "Entity",
     "Layer",
     "LineType",
+    "RGB_FILL_COLOR",
     "Report",
     "Settings",
     "Width",
@@ -46,6 +48,9 @@ BY_LAYER_LINE_TYPE = 33
 BY_BLOCK_LINE_TYPE = 34
 BY_LAYER_WIDTH = 17
 BY_BLOCK_WIDTH = 18
+#: ``color`` of a fill that uses its own ``rgb`` value, or the background color.
+RGB_FILL_COLOR = 257
+BACKGROUND_FILL_COLOR = 258
 
 _DEFAULTS = _core.best_effort_limit_defaults()
 
@@ -97,7 +102,7 @@ class Entity:
     ``line_type`` and ``width`` are file-local table indices, with the
     ``BY_LAYER_*`` and ``BY_BLOCK_*`` values deferring to the layer or block.
     ``children`` holds polyline members, package members, the loops of an
-    extended polygon and the text of a dimension.
+    extended polygon and the text of a dimension or leader.
     """
 
     type: str
@@ -122,6 +127,11 @@ class Entity:
     @property
     def hidden(self) -> bool:
         return bool(self.flags & 0x02)
+
+    @property
+    def reversed(self) -> bool:
+        """Whether a polyline follows this member arc from its end angle to its start."""
+        return self.flags & 0x18 == 0x18
 
     def walk(self) -> Iterator[Entity]:
         """This entity and every entity below it, parents first."""
@@ -292,7 +302,7 @@ class Drawing:
 
     def to_dict(self, *, include_entities: bool = True) -> dict:
         row: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "format": self.format,
             "marker": self.marker,
             "marker_observed": self.marker_observed,
@@ -418,7 +428,10 @@ def read(
     limits: ParseLimits | None = None,
     read_limits: BestEffortLimits | None = None,
 ) -> Drawing:
-    """Read every recognized object of MPZ, MPX or unprotected MPS bytes."""
+    """Read every recognized object of MPZ, MPX, MPS or MPUW bytes.
+
+    MPS and MPUW input must be saved without a password.
+    """
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
     return _drawing(_core.read_best_effort_bytes(data, *_limits(limits, read_limits)))
@@ -430,7 +443,7 @@ def readfile(
     limits: ParseLimits | None = None,
     read_limits: BestEffortLimits | None = None,
 ) -> Drawing:
-    """Read every recognized object of a regular MPZ, MPX or MPS file."""
+    """Read every recognized object of a regular MPZ, MPX, MPS or MPUW file."""
     return _drawing(
         _core.read_best_effort_file(fspath(path), *_limits(limits, read_limits))
     )

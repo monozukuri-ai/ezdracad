@@ -11,6 +11,7 @@ Dedicated fixtures cover document policies, root primitives, numeric dimensions,
 3D block lines, flat MPX, and unprotected MPS. `best-effort8` holds one object
 of every kind the best-effort reader decodes in an older record generation, one
 of a kind it does not decode, and one that does not fit its layout.
+`best-effort25u` holds the same content in the Unicode record layout.
 
 Construction code lives in `scripts/make_*_fixture.py` and
 `scripts/make_mps_fixtures.py`. MPX/MPS generators support `--check` to compare

@@ -22,7 +22,8 @@ fn summary(path: &Path) -> Result<()> {
 ```
 
 `read_best_effort` decodes every object whose saved layout is known, in the
-record generations 5, 8, 10, 22, and 25, and counts the rest by object kind. It
+raw markers 3 to 25 and in both record layouts, including MPUW input without a
+password, and counts the rest by object kind. It
 returns stored coordinates and file-local attribute references, applies no saved
 setting, and makes no claim of completeness. An object that does not fit its
 layout is skipped and counted; malformed tables and exhausted budgets are errors.
@@ -85,7 +86,8 @@ and print-setting APIs have their own explicit profiles and error boundaries.
 output. The default decompressed-size limit is 128 MiB. MPS decoding checks
 lengths, zlib EOF, checksum, and exact consumption, using the Rust
 `miniz_oxide` backend. Only the two supported unprotected wrappers are admitted;
-other compression, protection, and MPUW forms are unsupported.
+other compression and protection forms are unsupported. The two unprotected
+MPUW wrappers are decoded by `read_best_effort` only.
 
 Payload and entity offsets use `PayloadOffsetDomain`: `CfbStream` for MPZ,
 `File` for flat MPX, and `DecodedPayload` for MPS. MPS retains the wrapped-stream

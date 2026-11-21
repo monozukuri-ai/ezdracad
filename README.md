@@ -4,10 +4,11 @@ A read-only DRA-CAD parser with a Rust core and Python bindings.
 
 `ezdracad` inspects MPZ, flat MPX, and two supported unprotected MPS encodings.
 It offers two ways to read a drawing. The best-effort reader decodes every
-object whose saved layout is known, in older and newer record generations, and
-counts what it skipped. The qualified reader returns a conservative subset of
-lines, block placements, root circles, arcs, and literal text, and stops where
-it cannot establish the meaning. DRA-CAD is not required at runtime.
+object whose saved layout is known, in every record generation the application
+can save and in MPUW files without a password, and counts what it skipped. The
+qualified reader returns a conservative subset of lines, block placements, root
+circles, arcs, and literal text, and stops where it cannot establish the
+meaning. DRA-CAD is not required at runtime.
 
 This is alpha software with partial format support. A successful inspection
 or extraction does not establish complete drawing semantics, physical units,
@@ -39,8 +40,9 @@ print(drawing.report.decoded_counts)
 print(drawing.report.unsupported_counts, drawing.report.failed_counts)
 ```
 
-Lines, circles, arcs, ellipses, text, polylines with spline curves, hatches,
-dimensions, packages, and block placements are returned with their layer, color,
+Lines, circles, arcs, ellipses, text, polylines with spline and Bezier curves,
+fills, regions, hatches, dimensions, leaders, packages, block placements, and
+references to images and other drawings are returned with their layer, color,
 line-type, and width references. Objects of other kinds are counted, not
 guessed. Coordinates are the stored values; saved settings are reported and not
 applied. See [best-effort reading](docs/format/best-effort.md).

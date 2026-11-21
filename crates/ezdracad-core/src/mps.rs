@@ -45,10 +45,15 @@ const EXTENSION: [u8; 24] = [
 ];
 
 /// None means an unqualified protection/envelope profile; no data is decoded.
-pub(crate) fn decode(
+///
+/// With `unicode` set, the two envelopes of the Unicode drawing format are
+/// admitted too. Their payload uses another record layout, which only the
+/// best-effort reader understands.
+pub(crate) fn decode_envelope(
     bytes: &[u8],
     path: String,
     limits: &ParseLimits,
+    unicode: bool,
 ) -> Result<Option<(MpsInfo, Vec<u8>)>> {
     if bytes.len() < 122 {
         return Ok(None);
@@ -57,14 +62,15 @@ pub(crate) fn decode(
     for at in [0, 4, 8] {
         prefix[at] = 1;
     }
-    let extended = match u16::from_le_bytes([bytes[18], bytes[19]]) {
-        0 => false,
-        1 => true,
+    let kind = u16::from_le_bytes([bytes[18], bytes[19]]);
+    let (extended, wide) = match kind {
+        0 => (false, false),
+        1 => (true, false),
+        2 if unicode => (false, true),
+        3 if unicode => (true, true),
         _ => return Ok(None),
     };
-    if extended {
-        prefix[18] = 1;
-    }
+    prefix[18] = kind as u8;
     if bytes[..122] != prefix {
         return Ok(None);
     }
@@ -122,10 +128,11 @@ pub(crate) fn decode(
         stream_path: path,
         stream_size: bytes.len() as u64,
         stream_sha256: format!("{:x}", Sha256::digest(bytes)),
-        wrapper_profile: if extended {
-            "unprotected_extended_v1"
-        } else {
-            "unprotected_base_v1"
+        wrapper_profile: match (extended, wide) {
+            (false, false) => "unprotected_base_v1",
+            (true, false) => "unprotected_extended_v1",
+            (false, true) => "unprotected_unicode_base_v1",
+            (true, true) => "unprotected_unicode_extended_v1",
         },
         compression: MpsCompression::Zlib,
         decoded_size: decoded,

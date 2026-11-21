@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "ezdracad-core"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "cfb",
  "encoding_rs",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "ezdracad-python"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 dependencies = [
  "ezdracad-core",
  "pyo3",

@@ -2,9 +2,9 @@
 //!
 //! The qualified readers stop at the first object whose state they cannot
 //! establish. This module makes the opposite trade: it walks the whole record
-//! table of any observed record generation, decodes the objects whose layout is
-//! known, and reports everything else by tag. A result is a description of what
-//! the file stores, not a statement that the drawing is complete, that the
+//! table of any saved generation, decodes the objects whose layout is known,
+//! and reports everything else by kind. A result is a description of what the
+//! file stores, not a statement that the drawing is complete, that the
 //! coordinates have physical units, or that it matches the printed appearance.
 //!
 //! Malformed containers, inconsistent record tables and exhausted budgets are
@@ -34,7 +34,7 @@ pub struct BestEffortLimits {
     pub max_entities: u64,
     /// Nesting of objects inside packages, polylines and other compounds.
     pub max_depth: u64,
-    /// Points generated for spline polylines, summed over the drawing.
+    /// Points generated for curve polylines, summed over the drawing.
     pub max_curve_points: u64,
     pub max_block_definitions: u64,
     /// Retained diagnostics; further ones are only counted.
@@ -76,13 +76,13 @@ pub struct BestEffortSource {
 /// File-local attribute references of an object header.
 ///
 /// `color` uses 1..=256 for palette entries, 257 for the layer's color and 258
-/// for the enclosing block's color. `line_type` uses 1..=32, 33 for the layer
-/// and 34 for the block; `width` uses 1..=16, 17 for the layer and 18 for the
-/// block. These are table indices, not rendered colors or printed widths.
+/// for the enclosing block's color. `line_type` uses 33 for the layer and 34
+/// for the block; `width` uses 17 for the layer and 18 for the block. These
+/// are table indices, not rendered colors or printed widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BestEffortAttributes {
     pub tag_raw: u16,
-    /// High byte of the tag: 0x02 hidden, 0x08 polyline member, 0x10 reversed arc.
+    /// High byte of the tag: 0x02 hidden, 0x08 polyline member.
     pub flags_raw: u8,
     /// Layer number 0..=256.
     pub layer: u16,
@@ -93,7 +93,8 @@ pub struct BestEffortAttributes {
     pub width: u16,
     pub material: u8,
     pub group: u16,
-    /// Shared by a dimension and the members of the package that draws it.
+    /// Shared by a dimension or leader and the members of the package that
+    /// draws it.
     pub link_id: u16,
 }
 
@@ -106,10 +107,24 @@ impl BestEffortAttributes {
     pub const fn polyline_member(&self) -> bool {
         self.flags_raw & 0x08 != 0
     }
+    /// A polyline member arc that the polyline follows from its end angle to
+    /// its start angle. Arcs outside a polyline do not keep this flag.
     #[must_use]
-    pub const fn reversed_arc(&self) -> bool {
-        self.flags_raw & 0x10 != 0
+    pub const fn reversed_member(&self) -> bool {
+        self.flags_raw & 0x18 == 0x18
     }
+}
+
+/// Fill of a closed shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BestEffortFill {
+    /// 1..=256 palette entry, 257 the explicit `rgb`, 258 the background color.
+    pub color: u16,
+    pub rgb: [u8; 3],
+    /// Transparency in percent.
+    pub transparency: u8,
+    /// Whether the outline is drawn as well as the fill.
+    pub outline: bool,
 }
 
 /// Stored text with its saved size, placement and font fields.
@@ -117,10 +132,11 @@ impl BestEffortAttributes {
 pub struct BestEffortText {
     pub position: [f64; 2],
     pub elevation: f64,
-    /// Decoded string: Shift_JIS bytes and saved Unicode escapes expanded,
-    /// formatting codes removed. A line feed separates lines.
+    /// Decoded string: saved escapes expanded, formatting codes removed.
+    /// A line feed separates lines.
     pub text: String,
-    /// Stored bytes without the terminator.
+    /// Stored bytes without the terminator: Shift_JIS, or UTF-16 code units in
+    /// the Unicode drawing format.
     pub text_bytes: Vec<u8>,
     /// Character cell height and width as saved, without physical units.
     pub height: f64,
@@ -142,16 +158,40 @@ pub struct BestEffortText {
     pub item_raw: u16,
     /// The string contained formatting codes; only their content was kept.
     pub format_codes: bool,
-    /// Some bytes had no Shift_JIS meaning and were replaced.
+    /// Some bytes had no meaning in their encoding and were replaced.
     pub lossy: bool,
 }
 
-/// One family of parallel hatch lines.
+/// One family of parallel hatch lines with its own attribute references.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BestEffortHatchLine {
     pub origin: [f64; 2],
     pub pitch: f64,
     pub angle_degrees: f64,
+    pub color: u16,
+    pub line_type: u16,
+    pub width: u16,
+}
+
+/// A named hatch pattern. The pattern lines live in the application's pattern
+/// library, not in the drawing; `values` are its saved placement numbers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BestEffortHatchPattern {
+    pub name: String,
+    pub origin: [f64; 2],
+    pub values: Vec<f64>,
+    pub color: u16,
+    pub line_type: u16,
+    pub width: u16,
+}
+
+/// Arc of an angle dimension.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BestEffortDimensionArc {
+    pub center: [f64; 2],
+    pub radius: f64,
+    pub start_degrees: f64,
+    pub end_degrees: f64,
 }
 
 /// Geometry of one decoded object. Coordinates are the stored values.
@@ -175,8 +215,7 @@ pub enum BestEffortGeometry {
         center: [f64; 2],
         radius: f64,
         elevation: f64,
-        /// Bytes that hold fill state in filled circles; zero when unfilled.
-        fill_state: [u8; 16],
+        fill: Option<BestEffortFill>,
     },
     Arc {
         center: [f64; 2],
@@ -189,6 +228,7 @@ pub enum BestEffortGeometry {
         center: [f64; 2],
         radius: [f64; 2],
         rotation_degrees: f64,
+        fill: Option<BestEffortFill>,
     },
     EllipticalArc {
         center: [f64; 2],
@@ -202,6 +242,9 @@ pub enum BestEffortGeometry {
     Insert {
         name: String,
         name_bytes: Vec<u8>,
+        /// Nonzero when a reference package with the same number holds the
+        /// placed members of this insert as well.
+        reference_number: u32,
         position: [f64; 2],
         elevation: f64,
         scale: [f64; 2],
@@ -209,24 +252,30 @@ pub enum BestEffortGeometry {
     },
     /// Members are the entity's children, in stored order.
     Polyline {
-        /// 0 plain, 2 quadratic spline, 3 cubic spline, 4 Bezier.
+        /// 0 plain, 1 a saved evaluation of a spline, 2 quadratic spline,
+        /// 3 cubic spline, 4 Bezier.
         curve_kind: u8,
-        /// 0x01 closed, 0x02 fill only, 0x04 filled, 0x08 custom fill,
-        /// 0x10 spline through its points.
+        /// 0x01 closed, 0x02 fill without outline, 0x04 filled, 0x08 explicit
+        /// fill color, 0x10 spline through its points.
         flags_raw: u8,
-        fill_color: u8,
         divisions: u8,
         three_d: bool,
-        /// Evaluated curve of a cubic spline; the children are its control polygon.
+        fill: Option<BestEffortFill>,
+        /// Evaluated curve of a spline or Bezier polyline; the children are
+        /// its stored points.
         curve_points: Option<Vec<[f64; 2]>>,
     },
     /// A region bounded by its child polylines; a hatch refers to it by `link_id`.
     ExtendedPolygon {
         polygon_kind: u8,
-        /// 0x01 closed, 0x02 fill only, 0x04 filled, 0x08 custom fill.
+        /// 0x01 closed, 0x02 fill without outline, 0x04 filled.
         flags_raw: u8,
-        fill_color: u8,
-        loop_count: u32,
+        fill: Option<BestEffortFill>,
+        /// Serial number among the hatched regions; zero without a hatch.
+        reference_number: u32,
+        /// Number of child polylines that cut a hole; the first child is the
+        /// outer boundary.
+        hole_count: u16,
         link_id: u32,
     },
     /// Hatching of the extended polygon with the same `link_id`.
@@ -235,11 +284,10 @@ pub enum BestEffortGeometry {
         hatch_type: u16,
         link_id: u32,
         lines: Vec<BestEffortHatchLine>,
-        /// Origin of a named pattern; the pattern itself is not decoded.
-        pattern_origin: Option<[f64; 2]>,
+        pattern: Option<BestEffortHatchPattern>,
     },
-    /// The measured line and points. The numeric text is a child; the drawn
-    /// lines, arrowheads and text are members of a package with `link_id`.
+    /// The measured geometry. The numeric text is a child; the drawn lines,
+    /// arrowheads and text are members of a package with the same `link_id`.
     Dimension {
         /// 1 aligned, 2 linear, 3 angle, 4 radius, 5 diameter.
         dimension_type: u8,
@@ -248,11 +296,23 @@ pub enum BestEffortGeometry {
         arrow_styles: [u8; 4],
         text_position: u8,
         line: Option<[[f64; 2]; 2]>,
+        arc: Option<BestEffortDimensionArc>,
         extension_origins: Vec<[f64; 2]>,
         /// Arrow sizes of both ends in drawing coordinates.
         arrow_sizes: Option<[f64; 4]>,
         /// Arrow sizes of both ends as they are output on paper, when saved.
         arrow_paper_sizes: Option<[f64; 4]>,
+    },
+    /// A leader. Its text is a child; the drawn polyline, arrowhead and text
+    /// are members of a package with the same `link_id`.
+    Leader {
+        leader_type: u8,
+        flags_raw: u8,
+        flags2_raw: u8,
+        arrow_style: u8,
+        lines: Vec<[[f64; 2]; 2]>,
+        arrow_size: [f64; 2],
+        arrow_paper_size: [f64; 2],
     },
     /// Members are the entity's children.
     Package {
@@ -270,6 +330,27 @@ pub enum BestEffortGeometry {
         /// 11 slash, 12 integral sign.
         arrow_type: u8,
         flags_raw: u8,
+    },
+    /// A placed raster image, kept as a reference to its file.
+    Image {
+        file_name: String,
+        directory: String,
+        position: [f64; 2],
+        elevation: f64,
+        scale: [f64; 2],
+        /// Width and height of the placed image.
+        size: [f64; 2],
+        rotation_degrees: f64,
+    },
+    /// Another drawing shown inside this one, kept as a reference to its file.
+    ExternalReference {
+        file_name: String,
+        directory: String,
+        relative_directory: String,
+        position: [f64; 2],
+        elevation: f64,
+        scale: [f64; 2],
+        rotation_degrees: f64,
     },
 }
 
@@ -290,8 +371,11 @@ impl BestEffortGeometry {
             Self::ExtendedPolygon { .. } => "EXTENDED_POLYGON",
             Self::Hatch { .. } => "HATCH",
             Self::Dimension { .. } => "DIMENSION",
+            Self::Leader { .. } => "LEADER",
             Self::Package { .. } => "PACKAGE",
             Self::Arrowhead { .. } => "ARROWHEAD",
+            Self::Image { .. } => "IMAGE",
+            Self::ExternalReference { .. } => "EXTERNAL_REFERENCE",
         }
     }
 }
@@ -317,6 +401,7 @@ impl BestEffortEntity {
 pub struct BestEffortBlock {
     pub index: u64,
     pub name: String,
+    /// Name as stored; block references repeat these bytes.
     pub name_bytes: Vec<u8>,
     pub header_offset: u64,
     pub entities: Vec<BestEffortEntity>,
@@ -410,7 +495,7 @@ impl BestEffortReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BestEffortDrawing {
     pub format: DracadFormat,
-    /// Raw generation field of the payload header, not an application version.
+    /// Raw generation field of the payload header.
     pub marker_raw: u16,
     /// Whether this generation is one the reader has been checked against.
     pub marker_observed: bool,
@@ -427,7 +512,8 @@ pub struct BestEffortDrawing {
     pub report: BestEffortReport,
 }
 
-/// Read every recognized object of an MPZ, flat MPX or unprotected MPS input.
+/// Read every recognized object of an MPZ, flat MPX, unprotected MPS or
+/// unprotected MPUW input.
 pub fn read_best_effort(
     data: &[u8],
     parse_limits: &ParseLimits,

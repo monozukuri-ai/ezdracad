@@ -8,7 +8,8 @@
 | MPX | Observed marker-25 flat-file envelope, with original file offsets |
 | MPS | Two supported unprotected, single-zlib-member wrappers; separate wrapped and decoded source metadata |
 | Generic CFB | Metadata inventory without drawing interpretation |
-| MPUW, protected MPS, other MPS compression modes | Unsupported |
+| MPUW | Best-effort reader only: two unprotected, single-zlib-member wrappers with 80-byte records |
+| Protected MPS and MPUW, other compression modes | Unsupported |
 
 Format detection uses content, not the extension. Container inspection, raw
 record support, and geometry support are separate. An MPS payload can be
@@ -18,14 +19,16 @@ A raw marker is not an application release number.
 ## Geometry support
 
 Two readers have different boundaries. The [best-effort reader](format/best-effort.md)
-decodes points, lines, circles, arcs, ellipses, text, polylines, cubic splines,
-extended polygons, hatches by line families, dimensions, packages, arrowheads,
-and block placements in the record generations 5, 8, 10, 22, and 25, including
-flat MPX of those generations. It counts images, external references, layouts,
+decodes points, lines, circles, arcs, ellipses, text, polylines, quadratic and
+cubic splines, Bezier curves, fills, extended polygons, hatches, dimensions,
+leaders, packages, arrowheads, block placements, and references to images and
+other drawings. It reads the raw markers 3 to 25, which are the generations the
+application can save, in MPZ, flat MPX, MPS, and MPUW input. It counts layouts,
 viewports, three-dimensional solids, and any other object kind without decoding
-them. Named hatch patterns, quadratic and Bezier curves, and the fill of circles
-and ellipses are reported without being evaluated. Its output is the stored
-state, with no claim of completeness.
+them. A named hatch pattern is returned by name and saved numbers; its lines
+belong to the pattern library of the application and are not in the drawing.
+Gradation hatches, image contents, and referenced drawings are not read. Its
+output is the stored state, with no claim of completeness.
 
 The qualified high-level reader is conservative and partial. The default line profile
 admits bounded planar stored-XY line and placement forms. An optional profile

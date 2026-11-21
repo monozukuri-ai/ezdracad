@@ -45,10 +45,11 @@ pub use attributes::{
 pub use basic2d::{root_curve_2d, Arc2D, Basic2DProfile, Circle2D, Curve2D, RootPrimitiveStyle};
 pub use best_effort::{
     read_best_effort, read_best_effort_file, BestEffortAttributes, BestEffortBlock,
-    BestEffortColor, BestEffortDiagnostic, BestEffortDrawing, BestEffortEntity, BestEffortGeometry,
-    BestEffortHatchLine, BestEffortLayer, BestEffortLimits, BestEffortLineType, BestEffortReport,
-    BestEffortSettings, BestEffortSource, BestEffortTable, BestEffortText, BestEffortWidth,
-    DEFAULT_MAX_BEST_EFFORT_CURVE_POINTS, DEFAULT_MAX_BEST_EFFORT_DEPTH,
+    BestEffortColor, BestEffortDiagnostic, BestEffortDimensionArc, BestEffortDrawing,
+    BestEffortEntity, BestEffortFill, BestEffortGeometry, BestEffortHatchLine,
+    BestEffortHatchPattern, BestEffortLayer, BestEffortLimits, BestEffortLineType,
+    BestEffortReport, BestEffortSettings, BestEffortSource, BestEffortTable, BestEffortText,
+    BestEffortWidth, DEFAULT_MAX_BEST_EFFORT_CURVE_POINTS, DEFAULT_MAX_BEST_EFFORT_DEPTH,
     DEFAULT_MAX_BEST_EFFORT_DIAGNOSTICS, DEFAULT_MAX_BEST_EFFORT_ENTITIES,
 };
 pub use block3d::{

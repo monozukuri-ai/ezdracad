@@ -3,7 +3,8 @@
 Two supported unprotected SecureContents wrappers use the existing inspection,
 raw scan, and document APIs. Detection checks the CFB identity and exact wrapper
 profile. Passwords are not accepted. Unknown protection, other compression
-modes, multiple chunks, and MPUW remain unsupported.
+modes, and multiple chunks remain unsupported. MPUW input is read by the
+[best-effort reader](best-effort.md) only.
 
 ```python
 from ezdracad import ParseLimits, raw

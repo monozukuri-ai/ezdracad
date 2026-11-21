@@ -12,7 +12,7 @@ strict/partial behavior.
 | `read_basic2d` | `basic2d25.cfb` |
 | `read_mpx` | `mpx*.mpx` |
 | `read_mps` | `mps-*.mps` |
-| `read_best_effort` | `best-effort8.cfb`, `best-effort8.bin`, `basic2d25.cfb` |
+| `read_best_effort` | `best-effort8.cfb`, `best-effort8.bin`, `best-effort25u.mpuw`, `basic2d25.cfb` |
 
 Use nightly Rust and `cargo-fuzz`:
 

@@ -7,17 +7,14 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
+use super::tree::Layout;
 use crate::format::DRAWING_MAGIC;
 use crate::limits::check_limit;
 use crate::preflight::{invalid, CFB_MAGIC};
-use crate::{DracadError, DracadFormat, ParseLimits, Result, RECORD_SIZE};
+use crate::{DracadError, DracadFormat, ParseLimits, Result};
 
-/// Generations the layouts in this module were checked against.
-const OBSERVED_MARKERS: [u16; 5] = [5, 8, 10, 22, 25];
-const TABLE_SIZES: [u64; 4] = [16320, 16320, 2048, 1024];
 /// First extension header of the tail that follows the block definitions.
 const TAIL_SIGNATURE: [u8; 16] = [2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0];
-const BLOCK_HEADER_SIZE: u64 = 176;
 
 pub(crate) struct Carrier {
     pub format: DracadFormat,
@@ -25,16 +22,33 @@ pub(crate) struct Carrier {
     pub sha256: String,
 }
 
+/// Rows of one style table: `first` is the index the first row stands for.
+#[derive(Clone, Copy)]
+pub(crate) struct TableSpec {
+    pub start: u64,
+    pub rows: usize,
+    pub row: usize,
+    pub first: u16,
+}
+
+pub(crate) struct TableSpecs {
+    pub layers: TableSpec,
+    pub colors: TableSpec,
+    pub line_types: TableSpec,
+    pub widths: TableSpec,
+    /// Offset and length of the name field of a layer row.
+    pub layer_name: (usize, usize),
+}
+
 pub(crate) struct Header {
     pub marker_raw: u16,
-    pub marker_observed: bool,
+    pub layout: Layout,
     pub record_start: u64,
     /// Records of the root table, terminal included.
     pub record_count: u64,
     pub payload_end: u64,
-    /// Starts of the layer, color, line-type and width tables when their sizes
-    /// match the observed layout.
-    pub tables: Option<[u64; 4]>,
+    /// Style tables, when their sizes match a known layout.
+    pub tables: Option<TableSpecs>,
     pub tail_start: u64,
     pub block_start: u64,
 }
@@ -58,9 +72,9 @@ pub(crate) fn open(data: &[u8], limits: &ParseLimits) -> Result<Carrier> {
             sha256: format!("{:x}", Sha256::digest(data)),
         });
     }
-    let info = crate::inspect(data, limits)?;
+    let info = crate::inspect::inspect_with(data, limits, true)?;
     match info.format {
-        DracadFormat::Mpz | DracadFormat::Mps => {
+        DracadFormat::Mpz | DracadFormat::Mps | DracadFormat::Mpuw => {
             let payload = info.contents_arc()?;
             let sha256 = info
                 .payload
@@ -74,7 +88,8 @@ pub(crate) fn open(data: &[u8], limits: &ParseLimits) -> Result<Carrier> {
             })
         }
         DracadFormat::MpsCandidate => Err(DracadError::UnsupportedFormat(
-            "protected or unrecognized MPS encoding; the drawing payload cannot be decoded".into(),
+            "protected or unrecognized MPS or MPUW encoding; the drawing payload cannot be decoded"
+                .into(),
         )),
         DracadFormat::Mpx | DracadFormat::UnknownCfb => Err(DracadError::UnsupportedFormat(
             "compound file is not a DRA-CAD drawing container".into(),
@@ -87,6 +102,38 @@ pub(crate) fn word(bytes: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from(u32::from_le_bytes([
         raw[0], raw[1], raw[2], raw[3],
     ])))
+}
+
+fn table_specs(sections: &[u64; 7], layout: Layout) -> Option<TableSpecs> {
+    let sizes: Vec<u64> = sections[..5]
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .collect();
+    let spec = |index: usize, rows: usize, row: usize, first: u16| TableSpec {
+        start: sections[index],
+        rows,
+        row,
+        first,
+    };
+    if !layout.unicode && sizes == [16320, 16320, 2048, 1024] {
+        Some(TableSpecs {
+            layers: spec(0, 255, 64, 1),
+            colors: spec(1, 255, 64, 1),
+            line_types: spec(2, 32, 64, 1),
+            widths: spec(3, 16, 64, 1),
+            layer_name: (32, 32),
+        })
+    } else if layout.unicode && sizes == [282_624, 24_768, 141_312, 24_576] {
+        Some(TableSpecs {
+            layers: spec(0, 512, 552, 0),
+            colors: spec(1, 258, 96, 0),
+            line_types: spec(2, 256, 552, 0),
+            widths: spec(3, 256, 96, 0),
+            layer_name: (32, 520),
+        })
+    } else {
+        None
+    }
 }
 
 pub(crate) fn parse_header(
@@ -112,9 +159,10 @@ pub(crate) fn parse_header(
         .checked_add(1)
         .ok_or_else(|| invalid("record count overflow"))?;
     check_limit("records", record_count, limits.max_records)?;
-    if record_count.checked_mul(RECORD_SIZE) != Some(end - start) {
-        return Err(invalid("record count/stride/end relation is inconsistent"));
-    }
+    let layout = [Layout::NARROW, Layout::WIDE]
+        .into_iter()
+        .find(|layout| record_count.checked_mul(layout.record as u64) == Some(end - start))
+        .ok_or_else(|| invalid("record count/stride/end relation is inconsistent"))?;
     let declared_end = field(0x50)?;
     let payload_end = if declared_end == 0 && format == DracadFormat::Mpx {
         length
@@ -130,22 +178,17 @@ pub(crate) fn parse_header(
     if sections.windows(2).any(|pair| pair[1] < pair[0]) || sections[6] > payload_end {
         return Err(invalid("post-record boundaries are inconsistent"));
     }
-    let tables = sections[..5]
-        .windows(2)
-        .zip(TABLE_SIZES)
-        .all(|(pair, size)| pair[1] - pair[0] == size)
-        .then(|| [sections[0], sections[1], sections[2], sections[3]]);
     let block_start = field(0x4c)?;
     if block_start != 0 && !(sections[6]..=payload_end).contains(&block_start) {
         return Err(invalid("block table start is outside the payload tail"));
     }
     Ok(Header {
         marker_raw,
-        marker_observed: OBSERVED_MARKERS.contains(&marker_raw),
+        layout,
         record_start: start,
         record_count,
         payload_end,
-        tables,
+        tables: table_specs(&sections, layout),
         tail_start: sections[6],
         block_start,
     })
@@ -156,58 +199,82 @@ fn slice(bytes: &[u8], start: u64, size: u64) -> Option<&[u8]> {
     bytes.get(usize::try_from(start).ok()?..usize::try_from(end).ok()?)
 }
 
-/// Block definition tables, walked until the tail signature.
+/// Name bytes of a definition header: up to the first NUL byte, or NUL unit
+/// in the Unicode layout.
+fn block_name(field: &[u8], unicode: bool) -> Option<Vec<u8>> {
+    let end = if unicode {
+        field
+            .chunks_exact(2)
+            .position(|unit| unit == [0, 0])
+            .map(|units| units * 2)?
+    } else {
+        field.iter().position(|byte| *byte == 0)?
+    };
+    (end != 0).then(|| field[..end].to_vec())
+}
+
+/// Block definition tables, walked until the tail.
 ///
-/// The second value is the offset of the tail extensions when it was found;
-/// the third says whether the walk ended somewhere else.
+/// The second value is the offset of the tail extensions when they were
+/// found; the third says whether the walk of the older layout ended anywhere
+/// else. The Unicode layout has no such extensions and simply ends.
 pub(crate) fn block_ranges(
     bytes: &[u8],
     header: &Header,
     max_definitions: u64,
     max_records: u64,
 ) -> Result<(Vec<BlockRange>, Option<u64>, bool)> {
+    let unicode = header.layout.unicode;
+    let record = header.layout.record as u64;
+    let (prefix, header_size, name_size, count_at) = if unicode {
+        (1096, 656, 520, 524)
+    } else {
+        (296, 176, 32, 36)
+    };
     let mut ranges = Vec::new();
+    if unicode && header.block_start == 0 {
+        return Ok((ranges, None, false));
+    }
     let mut cursor = if header.block_start != 0 {
         header.block_start
     } else {
         // Without definitions the tail follows a fixed empty prefix.
-        match header.tail_start.checked_add(296) {
+        match header.tail_start.checked_add(prefix) {
             Some(cursor) => cursor,
             None => return Ok((ranges, None, true)),
         }
     };
     let mut total = header.record_count;
     loop {
-        match slice(bytes, cursor, 16) {
-            Some(signature) if signature == TAIL_SIGNATURE => {
-                return Ok((ranges, Some(cursor), false))
+        if !unicode {
+            match slice(bytes, cursor, 16) {
+                Some(signature) if signature == TAIL_SIGNATURE => {
+                    return Ok((ranges, Some(cursor), false))
+                }
+                Some(_) if header.block_start != 0 => {}
+                _ => return Ok((ranges, None, true)),
             }
-            Some(_) if header.block_start != 0 => {}
-            _ => return Ok((ranges, None, true)),
         }
-        let Some(head) = slice(bytes, cursor, BLOCK_HEADER_SIZE) else {
-            return Ok((ranges, None, true));
+        let Some(head) = slice(bytes, cursor, header_size) else {
+            return Ok((ranges, None, !unicode));
         };
-        let Some(name_end) = head[..32].iter().position(|byte| *byte == 0) else {
-            return Ok((ranges, None, true));
+        let Some(name_bytes) = block_name(&head[..name_size as usize], unicode) else {
+            return Ok((ranges, None, !unicode));
         };
-        if name_end == 0 {
-            return Ok((ranges, None, true));
-        }
-        let record_count = u64::from(u32::from_le_bytes([head[36], head[37], head[38], head[39]]));
-        let record_start = cursor + BLOCK_HEADER_SIZE;
+        let record_count = word(head, count_at).unwrap_or(0);
+        let record_start = cursor + header_size;
         let Some(table_end) = record_count
             .checked_add(1)
-            .and_then(|count| count.checked_mul(RECORD_SIZE))
+            .and_then(|count| count.checked_mul(record))
             .and_then(|extent| record_start.checked_add(extent))
             .filter(|end| *end <= header.payload_end)
         else {
-            return Ok((ranges, None, true));
+            return Ok((ranges, None, !unicode));
         };
         // The terminal must sit exactly where the declared count puts it.
-        match slice(bytes, table_end - RECORD_SIZE, 2) {
+        match slice(bytes, table_end - record, 2) {
             Some([0xff, _]) => {}
-            _ => return Ok((ranges, None, true)),
+            _ => return Ok((ranges, None, !unicode)),
         }
         check_limit(
             "block_definitions",
@@ -220,7 +287,7 @@ pub(crate) fn block_ranges(
         check_limit("records", total, max_records)?;
         ranges.push(BlockRange {
             header_offset: cursor,
-            name_bytes: head[..name_end].to_vec(),
+            name_bytes,
             record_start,
             record_count,
         });

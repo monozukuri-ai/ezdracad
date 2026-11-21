@@ -3,8 +3,9 @@
 ## Choose a reader
 
 `ezdracad.best_effort.readfile` decodes every object whose saved layout is known
-and reports the rest by count. It reads older and newer record generations and is
-the reader to use for display or conversion.
+and reports the rest by count. It reads every record generation the application
+can save, and MPUW files without a password, and is the reader to use for
+display or conversion.
 
 ```python
 from ezdracad import best_effort

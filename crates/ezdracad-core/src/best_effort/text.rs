@@ -53,6 +53,74 @@ pub(crate) fn body(bytes: &[u8]) -> Decoded {
     }
 }
 
+/// Decode a string body saved as UTF-16 code units. Escape and formatting
+/// codes are handled as in [`body`].
+pub(crate) fn wide_body(bytes: &[u8]) -> Decoded {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let (source, lossy) = match String::from_utf16(&units) {
+        Ok(text) => (text, false),
+        Err(_) => (String::from_utf16_lossy(&units), true),
+    };
+    let mut format_codes = false;
+    let text = expand(&source, &mut format_codes, 0)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    Decoded {
+        text,
+        format_codes,
+        lossy,
+    }
+}
+
+/// How many characters of `text` are usual in a font name.
+fn usual(text: &str) -> usize {
+    text.chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, ' ' | '-' | '_' | '.' | '(' | ')' | '@')
+                || matches!(
+                    *character as u32,
+                    0x3000 | 0x3040..=0x30ff | 0xff01..=0xff5e
+                )
+        })
+        .count()
+}
+
+/// Decode a saved font name.
+///
+/// Generations before 25 store Shift_JIS. From generation 25 on, a name is
+/// stored as UTF-16 or as Shift_JIS without a field that says which, so the
+/// reading with the larger share of characters usual in font names wins.
+pub(crate) fn font_name(bytes: &[u8], marker: u16) -> String {
+    let (narrow, narrow_lossy) = shift_jis(bytes);
+    if marker < 25 {
+        return narrow;
+    }
+    let (wide, wide_lossy) = utf16(bytes);
+    let share = |text: &str, lossy: bool| -> (usize, usize) {
+        let total = text.chars().count();
+        if lossy || total == 0 {
+            (0, 1)
+        } else {
+            (usual(text), total)
+        }
+    };
+    let (narrow_usual, narrow_total) = share(&narrow, narrow_lossy);
+    let (wide_usual, wide_total) = share(&wide, wide_lossy);
+    // Compare the shares as fractions; equal shares go to the longer reading,
+    // then to UTF-16, which is the usual form in these generations.
+    let left = narrow_usual * wide_total;
+    let right = wide_usual * narrow_total;
+    if left > right || (left == right && narrow_usual > wide_usual) {
+        narrow
+    } else {
+        wide
+    }
+}
+
 fn expand(source: &str, format_codes: &mut bool, depth: u8) -> String {
     let mut result = String::with_capacity(source.len());
     let mut rest = source;
@@ -195,6 +263,51 @@ mod tests {
         let decoded = body(&[0x41, 0x81]);
         assert!(decoded.lossy);
         assert!(decoded.text.starts_with('A'));
+    }
+
+    #[test]
+    fn wide_bodies_expand_the_same_codes() {
+        let bytes: Vec<u8> = "a{\\uni\"9ad9\"}{\\b\"B\"}\rz"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let decoded = wide_body(&bytes);
+        assert_eq!(decoded.text, "a\u{9ad9}B\nz");
+        assert!(decoded.format_codes && !decoded.lossy);
+        assert!(wide_body(&[0x00, 0xd8]).lossy);
+    }
+
+    #[test]
+    fn font_name_encoding_is_chosen_by_plausibility() {
+        let wide = |text: &str| -> Vec<u8> {
+            let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            bytes.resize(32, 0);
+            bytes
+        };
+        let narrow = |bytes: &[u8]| -> Vec<u8> {
+            let mut field = bytes.to_vec();
+            field.resize(32, 0);
+            field
+        };
+        // Fullwidth "MS" and katakana in Shift_JIS.
+        let gothic = [
+            0x82, 0x6c, 0x82, 0x72, 0x20, 0x83, 0x53, 0x83, 0x56, 0x83, 0x62, 0x83, 0x4e,
+        ];
+        let name = "\u{ff2d}\u{ff33} \u{30b4}\u{30b7}\u{30c3}\u{30af}";
+        assert_eq!(font_name(&narrow(&gothic), 25), name);
+        assert_eq!(font_name(&wide(name), 25), name);
+        assert_eq!(font_name(&wide("Arial"), 25), "Arial");
+        assert_eq!(font_name(&narrow(b"Century"), 25), "Century");
+        assert_eq!(
+            font_name(&wide("\u{6e38}\u{30b4}\u{30b7}\u{30c3}\u{30af}"), 25)
+                .chars()
+                .count(),
+            5
+        );
+        // Older generations never store UTF-16.
+        assert_eq!(font_name(&narrow(b"Century"), 22), "Century");
+        assert_eq!(font_name(&narrow(&gothic), 5), name);
+        assert_eq!(font_name(&[0; 32], 25), "");
     }
 
     #[test]

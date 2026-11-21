@@ -1,19 +1,23 @@
 //! Object decoders of the best-effort reader.
+//!
+//! Offsets are relative to the body of a record, which starts after its
+//! header: [`Node::body`] for objects and attributed parts, [`Node::plain`]
+//! and [`Node::part`] for plain parts and continuations.
 
 use crate::limits::check_limit;
 use crate::preflight::invalid;
-use crate::{ParseLimits, Result, RECORD_SIZE};
+use crate::{ParseLimits, Result};
 
-use super::payload::{self, Carrier, Header};
-use super::tree::{self, Node, TreeIssues};
+use super::curve::{self, CurveKind};
+use super::payload::{self, Carrier, Header, TableSpec};
+use super::tree::{self, Layout, Node, TreeIssues};
 use super::{
-    curve, text, BestEffortAttributes, BestEffortBlock, BestEffortColor, BestEffortDiagnostic,
-    BestEffortDrawing, BestEffortEntity, BestEffortGeometry, BestEffortHatchLine, BestEffortLayer,
+    text, BestEffortAttributes, BestEffortBlock, BestEffortColor, BestEffortDiagnostic,
+    BestEffortDimensionArc, BestEffortDrawing, BestEffortEntity, BestEffortFill,
+    BestEffortGeometry, BestEffortHatchLine, BestEffortHatchPattern, BestEffortLayer,
     BestEffortLimits, BestEffortLineType, BestEffortReport, BestEffortSettings, BestEffortSource,
     BestEffortTable, BestEffortText, BestEffortWidth,
 };
-
-const RECORD: usize = RECORD_SIZE as usize;
 
 // Object kinds, the low byte of a primary tag.
 const POINT: u8 = 1;
@@ -30,20 +34,37 @@ const HATCH: u8 = 13;
 const POLYLINE_3D: u8 = 18;
 const LINE_3D: u8 = 19;
 const NUMERIC_TEXT: u8 = 20;
+const OVERLAY: u8 = 24;
+const IMAGE: u8 = 25;
 const DIMENSION: u8 = 26;
+const LEADER: u8 = 27;
 const PACKAGE: u8 = 48;
 const PROPERTY: u8 = 51;
 const ARROWHEAD: u8 = 52;
 // Parts that only occur inside their owning object.
 const DIMENSION_LINE: u8 = 0x41;
+const DIMENSION_ARC: u8 = 0x42;
 const DIMENSION_EXTENSION: u8 = 0x43;
 const DIMENSION_ARROWS: u8 = 0x44;
-const DIMENSION_PAPER_ARROWS: u8 = 0x50;
+const LEADER_LINE: u8 = 0x46;
+const FILE_NAMES: u8 = 0x4a;
+const LONG_NAME: u8 = 0x59;
 const HATCH_LINE: u8 = 0x4b;
 const HATCH_PATTERN: u8 = 0x4c;
+const HATCH_PATTERN_VALUES: u8 = 0x4d;
+const HATCH_PATTERN_NAME: u8 = 0x4e;
+const DIMENSION_PAPER_ARROWS: u8 = 0x50;
 
-const CUBIC_SPLINE: u8 = 3;
-const POLYLINE_CLOSED: u8 = 0x01;
+const CLOSED: u8 = 0x01;
+const FILL_ONLY: u8 = 0x02;
+const FILLED: u8 = 0x04;
+const CUSTOM_FILL: u8 = 0x08;
+const THROUGH_POINTS: u8 = 0x10;
+const BACKGROUND_FILL: u8 = 0x20;
+/// Fill color byte that stands for an explicit RGB value.
+const RGB_FILL: u8 = 0xfd;
+
+type Decoded = std::result::Result<(BestEffortGeometry, Vec<BestEffortEntity>), &'static str>;
 
 fn number(bytes: &[u8], at: usize) -> Option<f64> {
     let raw: [u8; 8] = bytes.get(at..at + 8)?.try_into().ok()?;
@@ -63,17 +84,37 @@ fn long(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
-fn attributes(head: &[u8]) -> BestEffortAttributes {
-    let tag_raw = short(head, 0);
+fn attributes(record: &[u8], layout: Layout) -> BestEffortAttributes {
+    let tag_raw = short(record, 0);
     let flags_raw = (tag_raw >> 8) as u8;
-    let layer_raw = short(head, 2);
-    // The color byte is extended by three tag bits: 0x04 alone selects entry
-    // 256, with 0x20 the layer's color and with 0x40 the block's color.
-    let color = match (head[4], flags_raw & 0x64) {
-        (0, 0x24) => 257,
-        (0, 0x44) => 258,
-        (0, 0x04) => 256,
-        (value, _) => u16::from(value),
+    let (layer_raw, color_raw, line_type, width, material, group, link_id) = if layout.unicode {
+        (
+            short(record, 10),
+            long(record, 4).min(u32::from(u16::MAX)) as u16,
+            record[8],
+            record[9],
+            0,
+            short(record, 16),
+            short(record, 20),
+        )
+    } else {
+        (
+            short(record, 2),
+            u16::from(record[4]),
+            record[5],
+            record[6],
+            record[7],
+            short(record, 10),
+            short(record, 14),
+        )
+    };
+    // A zero color defers: to the layer with tag bit 0x20, to the block with
+    // 0x40, and otherwise stands for palette entry 256.
+    let color = match color_raw {
+        0 if flags_raw & 0x20 != 0 => 257,
+        0 if flags_raw & 0x40 != 0 => 258,
+        0 => 256,
+        value => value,
     };
     let dependent = |value: u8, by_layer: u16, by_block: u16| match value {
         0 => by_layer,
@@ -86,16 +127,43 @@ fn attributes(head: &[u8]) -> BestEffortAttributes {
         layer: layer_raw & 0x01ff,
         segment: (layer_raw >> 9) as u8,
         color,
-        line_type: dependent(head[5], 33, 34),
-        width: dependent(head[6], 17, 18),
-        material: head[7],
-        group: short(head, 10),
-        link_id: short(head, 14),
+        line_type: dependent(line_type, 33, 34),
+        width: dependent(width, 17, 18),
+        material,
+        group,
+        link_id,
     }
+}
+
+/// Fill fields in their shared order: color, transparency, flags and RGB.
+///
+/// A shape is filled when its fill flag is set. Generations up to 4 have no
+/// such flag; there a fill color alone fills. An explicit RGB value is marked
+/// by a flag, by the reserved color byte, or by both.
+fn fill(color: u8, transparency: u8, flags: u8, rgb: &[u8], marker: u16) -> Option<BestEffortFill> {
+    let filled = flags & FILLED != 0 || (marker <= 4 && color != 0);
+    filled.then(|| BestEffortFill {
+        color: match color {
+            _ if flags & BACKGROUND_FILL != 0 => 258,
+            _ if flags & CUSTOM_FILL != 0 => 257,
+            RGB_FILL => 257,
+            0 => 256,
+            value => u16::from(value),
+        },
+        rgb: [rgb[0], rgb[1], rgb[2]],
+        transparency,
+        outline: flags & FILL_ONLY == 0,
+    })
+}
+
+/// Fill of a circle or ellipse, saved after the angles of its continuation.
+fn shape_fill(tail: &[u8], marker: u16) -> Option<BestEffortFill> {
+    fill(tail[32], tail[34], tail[35], &tail[36..39], marker)
 }
 
 struct Reader<'a> {
     marker_raw: u16,
+    layout: Layout,
     limits: &'a BestEffortLimits,
     report: BestEffortReport,
     entities: u64,
@@ -123,22 +191,35 @@ impl Reader<'_> {
         }
     }
 
-    fn failed(&mut self, node: &Node<'_>, table: BestEffortTable, reason: &str) {
-        *self.report.failed_counts.entry(node.tag as u8).or_default() += 1;
-        self.note(
-            "object_layout_mismatch",
-            format!("{reason}; the object was skipped"),
-            Some(table),
-            Some(node),
-        );
+    fn string(&self, bytes: &[u8]) -> String {
+        if self.layout.unicode {
+            text::utf16(bytes).0
+        } else {
+            text::shift_jis(bytes).0
+        }
     }
 
-    fn unsupported(&mut self, node: &Node<'_>) {
-        *self
-            .report
-            .unsupported_counts
-            .entry(node.tag as u8)
-            .or_default() += 1;
+    /// NUL-separated strings of a part and the continuations written after it.
+    fn strings(&self, node: &Node<'_>) -> Vec<String> {
+        let mut bytes = node.plain().to_vec();
+        for index in 0..node.continuations() {
+            if let Some(part) = node.part(index) {
+                bytes.extend_from_slice(part);
+            }
+        }
+        let unit = if self.layout.unicode { 2 } else { 1 };
+        let mut result = Vec::new();
+        let mut start = 0;
+        for at in (0..bytes.len() / unit).map(|index| index * unit) {
+            if bytes[at..at + unit].iter().all(|byte| *byte == 0) {
+                if at == start {
+                    break;
+                }
+                result.push(self.string(&bytes[start..at]));
+                start = at + unit;
+            }
+        }
+        result
     }
 
     fn entities(
@@ -162,37 +243,44 @@ impl Reader<'_> {
         table: BestEffortTable,
         base: u64,
     ) -> Result<Option<BestEffortEntity>> {
-        let kind = node.tag as u8;
-        let decoded: std::result::Result<(BestEffortGeometry, Vec<BestEffortEntity>), &str> =
-            match kind {
-                POINT => point_geometry(node),
-                LINE => line(node),
-                LINE_3D => line_3d(node),
-                CIRCLE => circle(node),
-                ARC => arc(node),
-                ELLIPSE => ellipse(node, false),
-                ELLIPTICAL_ARC => ellipse(node, true),
-                TEXT | NUMERIC_TEXT => self.text(node),
-                BLOCK_REFERENCE => insert(node),
-                ARROWHEAD => arrowhead(node),
-                POLYLINE | POLYLINE_3D => self.polyline(node, table, base)?,
-                EXTENDED_POLYGON => self.extended_polygon(node, table, base)?,
-                HATCH => self.hatch(node, table),
-                DIMENSION => self.dimension(node, table, base)?,
-                PACKAGE => self.package(node, table, base)?,
-                PROPERTY => {
-                    self.report.property_records += 1;
-                    return Ok(None);
-                }
-                _ => {
-                    self.unsupported(node);
-                    return Ok(None);
-                }
-            };
+        let decoded: Decoded = match node.tag as u8 {
+            POINT => point_geometry(node),
+            LINE => line(node),
+            LINE_3D => line_3d(node),
+            CIRCLE => circle(node, self.marker_raw),
+            ARC => arc(node),
+            ELLIPSE => ellipse(node, false, self.marker_raw),
+            ELLIPTICAL_ARC => ellipse(node, true, self.marker_raw),
+            TEXT | NUMERIC_TEXT => self.text(node),
+            BLOCK_REFERENCE => self.insert(node),
+            ARROWHEAD => arrowhead(node),
+            IMAGE => self.placed_file(node, true),
+            OVERLAY => self.placed_file(node, false),
+            POLYLINE | POLYLINE_3D => self.polyline(node, table, base)?,
+            EXTENDED_POLYGON => self.extended_polygon(node, table, base)?,
+            HATCH => self.hatch(node, table),
+            DIMENSION => self.dimension(node, table, base)?,
+            LEADER => self.leader(node, table, base)?,
+            PACKAGE => self.package(node, table, base)?,
+            PROPERTY => {
+                self.report.property_records += 1;
+                return Ok(None);
+            }
+            kind => {
+                *self.report.unsupported_counts.entry(kind).or_default() += 1;
+                return Ok(None);
+            }
+        };
         let (geometry, children) = match decoded {
             Ok(value) => value,
             Err(reason) => {
-                self.failed(node, table, reason);
+                *self.report.failed_counts.entry(node.tag as u8).or_default() += 1;
+                self.note(
+                    "object_layout_mismatch",
+                    format!("{reason}; the object was skipped"),
+                    Some(table),
+                    Some(node),
+                );
                 return Ok(None);
             }
         };
@@ -208,11 +296,11 @@ impl Reader<'_> {
             .entry(geometry.kind())
             .or_default() += 1;
         Ok(Some(BestEffortEntity {
-            attributes: attributes(node.head()),
+            attributes: attributes(node.record(), self.layout),
             source: BestEffortSource {
                 table,
                 record_index: node.index,
-                payload_offset: base + node.index * RECORD_SIZE,
+                payload_offset: base + node.index * self.layout.record as u64,
                 record_count: node.record_count,
             },
             geometry,
@@ -220,61 +308,61 @@ impl Reader<'_> {
         }))
     }
 
-    fn text(
-        &mut self,
-        node: &Node<'_>,
-    ) -> std::result::Result<(BestEffortGeometry, Vec<BestEffortEntity>), &'static str> {
+    fn text(&mut self, node: &Node<'_>) -> Decoded {
         const SHORT: &str = "text has fewer continuation records than its layout";
         const NUMBER: &str = "text has a non-finite field";
-        let head = node.head();
-        let layout = node.continuation(0).ok_or(SHORT)?;
-        let font = node.continuation(1).ok_or(SHORT)?;
-        let first_body = node.continuation(2).ok_or(SHORT)?;
-        let position = point(head, 16).ok_or(NUMBER)?;
-        let length = usize::from(short(layout, 16));
+        let body = node.body();
+        let layout = node.part(0).ok_or(SHORT)?;
+        let font = node.part(1).ok_or(SHORT)?;
+        let font_header = node.continuation(1).ok_or(SHORT)?;
+        let number_record = node.continuation(2).ok_or(SHORT)?;
+        let unit = if self.layout.unicode { 2 } else { 1 };
+        let length = usize::from(short(layout, 0)) * unit;
         let mut text_bytes = Vec::with_capacity(length);
         'body: for index in 2..node.continuations() {
-            let Some(record) = node.continuation(index) else {
+            let Some(part) = node.part(index) else {
                 break;
             };
-            for byte in &record[16..] {
-                if text_bytes.len() == length || *byte == 0 {
+            for unit_bytes in part.chunks_exact(unit) {
+                if text_bytes.len() == length || unit_bytes.iter().all(|byte| *byte == 0) {
                     break 'body;
                 }
-                text_bytes.push(*byte);
+                text_bytes.extend_from_slice(unit_bytes);
             }
         }
         if text_bytes.len() != length {
             return Err("text body is shorter than its declared length");
         }
-        let decoded = text::body(&text_bytes);
-        // Newer generations store the font name as UTF-16, older ones as Shift_JIS.
-        let (font_name, _) = if self.marker_raw >= 25 {
-            text::utf16(&font[32..])
+        let decoded = if self.layout.unicode {
+            text::wide_body(&text_bytes)
         } else {
-            text::shift_jis(&font[32..])
+            text::body(&text_bytes)
         };
         let numeric = node.tag as u8 == NUMERIC_TEXT;
         Ok((
             BestEffortGeometry::Text(Box::new(BestEffortText {
-                position,
-                elevation: number(head, 32).ok_or(NUMBER)?,
+                position: point(body, 0).ok_or(NUMBER)?,
+                elevation: number(body, 16).ok_or(NUMBER)?,
                 text: decoded.text,
                 text_bytes,
-                width: number(head, 40).ok_or(NUMBER)?,
-                height: number(head, 48).ok_or(NUMBER)?,
-                spacing: number(head, 56).ok_or(NUMBER)?,
-                rotation_degrees: number(font, 16).ok_or(NUMBER)?,
-                slant_degrees: number(font, 24).ok_or(NUMBER)?,
-                origin: short(layout, 18),
-                flags_raw: short(font, 6),
-                font_name,
-                charset: font[8],
-                family: font[9],
+                width: number(body, 24).ok_or(NUMBER)?,
+                height: number(body, 32).ok_or(NUMBER)?,
+                spacing: number(body, 40).ok_or(NUMBER)?,
+                rotation_degrees: number(font, 0).ok_or(NUMBER)?,
+                slant_degrees: number(font, 8).ok_or(NUMBER)?,
+                origin: short(layout, 2),
+                flags_raw: short(font_header, 6),
+                font_name: text::font_name(&font[16..], self.marker_raw),
+                charset: font_header[8],
+                family: font_header[9],
                 numeric,
-                number: if numeric { number(first_body, 8) } else { None },
-                unit_raw: short(font, 2),
-                item_raw: short(font, 4),
+                number: if numeric {
+                    number(number_record, 8)
+                } else {
+                    None
+                },
+                unit_raw: short(font_header, 2),
+                item_raw: short(font_header, 4),
                 format_codes: decoded.format_codes,
                 lossy: decoded.lossy,
             })),
@@ -282,22 +370,117 @@ impl Reader<'_> {
         ))
     }
 
-    #[allow(clippy::type_complexity)]
-    fn polyline(
-        &mut self,
-        node: &Node<'_>,
-        table: BestEffortTable,
-        base: u64,
-    ) -> Result<std::result::Result<(BestEffortGeometry, Vec<BestEffortEntity>), &'static str>>
-    {
-        let head = node.head();
-        let (curve_kind, flags_raw, fill_color, divisions) =
-            (head[16], head[17], head[18], head[19]);
+    fn insert(&mut self, node: &Node<'_>) -> Decoded {
+        const NUMBER: &str = "block reference has a non-finite field";
+        let tail = node
+            .part(0)
+            .ok_or("block reference has no continuation record")?;
+        let field = &node.body()[16..];
+        let unit = if self.layout.unicode { 2 } else { 1 };
+        let end = field
+            .chunks_exact(unit)
+            .position(|bytes| bytes.iter().all(|byte| *byte == 0))
+            .map_or(field.len(), |units| units * unit);
+        // A name too long for its field is saved in full in a part of its own;
+        // the field then holds an alias.
+        let long_name = node
+            .children
+            .iter()
+            .find(|child| child.tag as u8 == LONG_NAME)
+            .map(|child| {
+                let bytes = child.plain();
+                let end = bytes
+                    .chunks_exact(unit)
+                    .position(|unit| unit.iter().all(|byte| *byte == 0))
+                    .map_or(bytes.len(), |units| units * unit);
+                &bytes[..end]
+            });
+        let name_bytes = long_name.unwrap_or(&field[..end]);
+        Ok((
+            BestEffortGeometry::Insert {
+                name: self.string(name_bytes),
+                name_bytes: name_bytes.to_vec(),
+                reference_number: long(node.body(), 4),
+                position: point(tail, 0).ok_or(NUMBER)?,
+                elevation: number(tail, 16).ok_or(NUMBER)?,
+                scale: point(tail, 24).ok_or(NUMBER)?,
+                rotation_degrees: number(tail, 40).ok_or(NUMBER)?,
+            },
+            Vec::new(),
+        ))
+    }
+
+    /// An image or an external drawing: a placement and the names of a file.
+    fn placed_file(&mut self, node: &Node<'_>, image: bool) -> Decoded {
+        const SHORT: &str = "placed file has fewer continuation records than its layout";
+        const NUMBER: &str = "placed file has a non-finite field";
+        let placement = node.part(0).ok_or(SHORT)?;
+        let extent = node.part(1).ok_or(SHORT)?;
+        let mut names = node
+            .children
+            .iter()
+            .find(|child| child.tag as u8 == FILE_NAMES)
+            .map(|child| self.strings(child))
+            .unwrap_or_default()
+            .into_iter();
+        let file_name = names.next().unwrap_or_default();
+        let directory = names.next().unwrap_or_default();
+        let position = point(placement, 0).ok_or(NUMBER)?;
+        let elevation = number(placement, 16).ok_or(NUMBER)?;
+        let scale = point(placement, 24).ok_or(NUMBER)?;
+        let geometry = if image {
+            BestEffortGeometry::Image {
+                file_name,
+                directory,
+                position,
+                elevation,
+                scale,
+                size: point(extent, 0).ok_or(NUMBER)?,
+                rotation_degrees: number(extent, 16).ok_or(NUMBER)?,
+            }
+        } else {
+            BestEffortGeometry::ExternalReference {
+                file_name,
+                directory,
+                relative_directory: names.next().unwrap_or_default(),
+                position,
+                elevation,
+                scale,
+                // Rotations about three axes are saved; the last is in the plane.
+                rotation_degrees: number(extent, 16).ok_or(NUMBER)?,
+            }
+        };
+        Ok((geometry, Vec::new()))
+    }
+
+    fn polyline(&mut self, node: &Node<'_>, table: BestEffortTable, base: u64) -> Result<Decoded> {
+        let body = node.body();
+        let (curve_kind, flags_raw, divisions) = (body[0], body[1], body[3]);
         let children = self.entities(&node.children, table, base)?;
+        let kind = match curve_kind {
+            0 => None,
+            2 => Some(CurveKind::Quadratic),
+            3 if flags_raw & THROUGH_POINTS != 0 => Some(CurveKind::CubicThrough),
+            3 => Some(CurveKind::Cubic),
+            4 => Some(CurveKind::Bezier),
+            // A saved evaluation of the spline next to it.
+            1 => None,
+            _ => {
+                self.note(
+                    "curve_kind_not_evaluated",
+                    "the curve kind of this polyline is unknown; its stored points are returned",
+                    Some(table),
+                    Some(node),
+                );
+                None
+            }
+        };
         let mut curve_points = None;
-        if curve_kind == CUBIC_SPLINE && divisions != 0 {
-            if let Some(control) = control_polygon(&children) {
-                let spans = control.len().saturating_sub(1) as u64;
+        if let (Some(kind), true) = (kind, divisions != 0) {
+            if let Some(stored) = stored_points(&children) {
+                let closed = flags_raw & CLOSED != 0;
+                let repeated = stored.first() == stored.last();
+                let spans = curve::spans(kind, stored.len(), closed, repeated) as u64;
                 self.curve_points = self
                     .curve_points
                     .saturating_add(spans.saturating_mul(u64::from(divisions)) + 1);
@@ -306,93 +489,104 @@ impl Reader<'_> {
                     self.curve_points,
                     self.limits.max_curve_points,
                 )?;
-                curve_points = Some(curve::cubic_b_spline(
-                    &control,
+                curve_points = Some(curve::evaluate(
+                    kind,
+                    &stored,
                     usize::from(divisions),
-                    flags_raw & POLYLINE_CLOSED != 0,
+                    closed,
                 ));
             } else {
                 self.note(
-                    "spline_control_polygon_unusable",
-                    "spline members are not one connected run of lines; no curve was evaluated",
+                    "curve_points_unusable",
+                    "curve members are not one connected run of lines; no curve was evaluated",
                     Some(table),
                     Some(node),
                 );
             }
-        } else if curve_kind != 0 {
-            self.note(
-                "spline_kind_not_evaluated",
-                "only cubic splines are evaluated; the control polygon is returned",
-                Some(table),
-                Some(node),
-            );
         }
         Ok(Ok((
             BestEffortGeometry::Polyline {
                 curve_kind,
                 flags_raw,
-                fill_color,
                 divisions,
                 three_d: node.tag as u8 == POLYLINE_3D,
+                fill: fill(body[2], body[6], flags_raw, &body[8..11], self.marker_raw),
                 curve_points,
             },
             children,
         )))
     }
 
-    #[allow(clippy::type_complexity)]
     fn extended_polygon(
         &mut self,
         node: &Node<'_>,
         table: BestEffortTable,
         base: u64,
-    ) -> Result<std::result::Result<(BestEffortGeometry, Vec<BestEffortEntity>), &'static str>>
-    {
-        let head = node.head();
+    ) -> Result<Decoded> {
+        let body = node.body();
         let children = self.entities(&node.children, table, base)?;
+        let flags_raw = body[1];
         Ok(Ok((
             BestEffortGeometry::ExtendedPolygon {
-                polygon_kind: head[16],
-                flags_raw: head[17],
-                fill_color: head[18],
-                loop_count: long(head, 20),
-                link_id: long(head, 28),
+                polygon_kind: body[0],
+                flags_raw,
+                fill: fill(body[2], body[6], flags_raw, &body[8..11], self.marker_raw),
+                reference_number: u32::from(short(body, 4)),
+                hole_count: short(body, 14),
+                link_id: u32::from(short(body, 12)),
             },
             children,
         )))
     }
 
-    fn hatch(
-        &mut self,
-        node: &Node<'_>,
-        table: BestEffortTable,
-    ) -> std::result::Result<(BestEffortGeometry, Vec<BestEffortEntity>), &'static str> {
-        let head = node.head();
+    fn hatch(&mut self, node: &Node<'_>, table: BestEffortTable) -> Decoded {
+        const NUMBER: &str = "hatch part has a non-finite field";
+        let body = node.body();
         let mut lines = Vec::new();
-        let mut pattern_origin = None;
+        let mut pattern = None;
         let mut unknown_parts = 0u64;
         for child in &node.children {
-            let record = child.head();
+            let part = child.body();
+            let style = attributes(child.record(), self.layout);
             match child.tag as u8 {
                 HATCH_LINE => lines.push(BestEffortHatchLine {
-                    origin: point(record, 16).ok_or("hatch line has a non-finite field")?,
-                    pitch: number(record, 32).ok_or("hatch line has a non-finite field")?,
-                    angle_degrees: number(record, 40).ok_or("hatch line has a non-finite field")?,
+                    origin: point(part, 0).ok_or(NUMBER)?,
+                    pitch: number(part, 16).ok_or(NUMBER)?,
+                    angle_degrees: number(part, 24).ok_or(NUMBER)?,
+                    color: style.color,
+                    line_type: style.line_type,
+                    width: style.width,
                 }),
                 HATCH_PATTERN => {
-                    pattern_origin =
-                        Some(point(record, 16).ok_or("hatch pattern has a non-finite field")?);
+                    let mut values = Vec::new();
+                    for at in [16, 24, 32, 40] {
+                        values.push(number(part, at).ok_or(NUMBER)?);
+                    }
+                    let mut name = String::new();
+                    for detail in &child.children {
+                        match detail.tag as u8 {
+                            HATCH_PATTERN_VALUES => {
+                                for at in [0, 8, 16] {
+                                    values.push(number(detail.plain(), at).ok_or(NUMBER)?);
+                                }
+                            }
+                            HATCH_PATTERN_NAME => {
+                                name = self.strings(detail).into_iter().next().unwrap_or_default();
+                            }
+                            _ => unknown_parts += 1,
+                        }
+                    }
+                    pattern = Some(BestEffortHatchPattern {
+                        name,
+                        origin: point(part, 0).ok_or(NUMBER)?,
+                        values,
+                        color: style.color,
+                        line_type: style.line_type,
+                        width: style.width,
+                    });
                 }
                 _ => unknown_parts += 1,
             }
-        }
-        if pattern_origin.is_some() {
-            self.note(
-                "hatch_pattern_not_decoded",
-                "a named hatch pattern keeps its origin only; its lines are not decoded",
-                Some(table),
-                Some(node),
-            );
         }
         if unknown_parts != 0 {
             self.note(
@@ -404,60 +598,66 @@ impl Reader<'_> {
         }
         Ok((
             BestEffortGeometry::Hatch {
-                hatch_type: short(head, 16),
-                link_id: long(head, 18),
+                hatch_type: short(body, 0),
+                link_id: u32::from(short(body, 2)),
                 lines,
-                pattern_origin,
+                pattern,
             },
             Vec::new(),
         ))
     }
 
-    #[allow(clippy::type_complexity)]
-    fn dimension(
-        &mut self,
-        node: &Node<'_>,
-        table: BestEffortTable,
-        base: u64,
-    ) -> Result<std::result::Result<(BestEffortGeometry, Vec<BestEffortEntity>), &'static str>>
-    {
+    fn dimension(&mut self, node: &Node<'_>, table: BestEffortTable, base: u64) -> Result<Decoded> {
         const NUMBER: &str = "dimension part has a non-finite field";
-        let head = node.head();
+        let body = node.body();
         let mut line = None;
+        let mut arc = None;
         let mut extension_origins = Vec::new();
         let mut arrow_sizes = None;
         let mut arrow_paper_sizes = None;
         let mut children = Vec::new();
         let mut unknown_parts = 0u64;
         for child in &node.children {
-            let record = child.head();
-            match child.tag as u8 {
-                DIMENSION_LINE => match (point(record, 16), point(record, 32)) {
-                    (Some(start), Some(end)) => line = Some([start, end]),
+            let kind = child.tag as u8;
+            if matches!(kind, TEXT | NUMERIC_TEXT) {
+                if let Some(entity) = self.entity(child, table, base)? {
+                    children.push(entity);
+                }
+                continue;
+            }
+            let part = child.plain();
+            let pair = || Some((point(part, 0)?, point(part, 16)?));
+            match kind {
+                DIMENSION_LINE => match pair() {
+                    Some((start, end)) => line = Some([start, end]),
+                    None => return Ok(Err(NUMBER)),
+                },
+                DIMENSION_ARC => match (pair(), number(part, 32)) {
+                    (Some((center, [radius, start_degrees])), Some(end_degrees)) => {
+                        arc = Some(BestEffortDimensionArc {
+                            center,
+                            radius,
+                            start_degrees,
+                            end_degrees,
+                        });
+                    }
                     _ => return Ok(Err(NUMBER)),
                 },
-                DIMENSION_EXTENSION => match point(record, 16) {
+                DIMENSION_EXTENSION => match point(part, 0) {
                     Some(origin) => extension_origins.push(origin),
                     None => return Ok(Err(NUMBER)),
                 },
-                kind @ (DIMENSION_ARROWS | DIMENSION_PAPER_ARROWS) => {
-                    match (point(record, 16), point(record, 32)) {
-                        (Some(first), Some(second)) => {
-                            let sizes = Some([first[0], first[1], second[0], second[1]]);
-                            if kind == DIMENSION_ARROWS {
-                                arrow_sizes = sizes;
-                            } else {
-                                arrow_paper_sizes = sizes;
-                            }
+                DIMENSION_ARROWS | DIMENSION_PAPER_ARROWS => match pair() {
+                    Some((first, second)) => {
+                        let sizes = Some([first[0], first[1], second[0], second[1]]);
+                        if kind == DIMENSION_ARROWS {
+                            arrow_sizes = sizes;
+                        } else {
+                            arrow_paper_sizes = sizes;
                         }
-                        _ => return Ok(Err(NUMBER)),
                     }
-                }
-                TEXT | NUMERIC_TEXT => {
-                    if let Some(entity) = self.entity(child, table, base)? {
-                        children.push(entity);
-                    }
-                }
+                    None => return Ok(Err(NUMBER)),
+                },
                 _ => unknown_parts += 1,
             }
         }
@@ -471,12 +671,13 @@ impl Reader<'_> {
         }
         Ok(Ok((
             BestEffortGeometry::Dimension {
-                dimension_type: head[16],
-                flags_raw: head[17],
-                flags2_raw: head[18],
-                arrow_styles: [head[19], head[20], head[21], head[22]],
-                text_position: head[23],
+                dimension_type: body[0],
+                flags_raw: body[1],
+                flags2_raw: body[2],
+                arrow_styles: [body[3], body[4], body[5], body[6]],
+                text_position: body[7],
                 line,
+                arc,
                 extension_origins,
                 arrow_sizes,
                 arrow_paper_sizes,
@@ -485,35 +686,71 @@ impl Reader<'_> {
         )))
     }
 
-    #[allow(clippy::type_complexity)]
-    fn package(
-        &mut self,
-        node: &Node<'_>,
-        table: BestEffortTable,
-        base: u64,
-    ) -> Result<std::result::Result<(BestEffortGeometry, Vec<BestEffortEntity>), &'static str>>
-    {
-        let head = node.head();
+    fn leader(&mut self, node: &Node<'_>, table: BestEffortTable, base: u64) -> Result<Decoded> {
+        const NUMBER: &str = "leader part has a non-finite field";
+        let body = node.body();
+        let mut lines = Vec::new();
+        let mut children = Vec::new();
+        let mut unknown_parts = 0u64;
+        for child in &node.children {
+            match child.tag as u8 {
+                TEXT | NUMERIC_TEXT => {
+                    if let Some(entity) = self.entity(child, table, base)? {
+                        children.push(entity);
+                    }
+                }
+                LEADER_LINE => match (point(child.plain(), 0), point(child.plain(), 16)) {
+                    (Some(start), Some(end)) => lines.push([start, end]),
+                    _ => return Ok(Err(NUMBER)),
+                },
+                _ => unknown_parts += 1,
+            }
+        }
+        if unknown_parts != 0 {
+            self.note(
+                "leader_parts_ignored",
+                format!("{unknown_parts} leader part(s) of an unknown kind were ignored"),
+                Some(table),
+                Some(node),
+            );
+        }
+        let (Some(arrow_paper_size), Some(arrow_size)) = (point(body, 16), point(body, 32)) else {
+            return Ok(Err(NUMBER));
+        };
+        Ok(Ok((
+            BestEffortGeometry::Leader {
+                leader_type: body[0],
+                flags_raw: body[1],
+                flags2_raw: body[2],
+                arrow_style: body[3],
+                lines,
+                arrow_size,
+                arrow_paper_size,
+            },
+            children,
+        )))
+    }
+
+    fn package(&mut self, node: &Node<'_>, table: BestEffortTable, base: u64) -> Result<Decoded> {
+        let body = node.body();
         let children = self.entities(&node.children, table, base)?;
         Ok(Ok((
             BestEffortGeometry::Package {
-                package_kind: head[16],
-                flags_raw: head[17],
-                reference_number: long(head, 20),
+                package_kind: body[0],
+                flags_raw: body[1],
+                reference_number: long(body, 4),
             },
             children,
         )))
     }
 }
 
-type Decoded = std::result::Result<(BestEffortGeometry, Vec<BestEffortEntity>), &'static str>;
-
 fn point_geometry(node: &Node<'_>) -> Decoded {
-    let head = node.head();
+    let body = node.body();
     Ok((
         BestEffortGeometry::Point {
-            position: point(head, 16).ok_or("point has a non-finite coordinate")?,
-            point_type: long(head, 32),
+            position: point(body, 0).ok_or("point has a non-finite coordinate")?,
+            point_type: long(body, 16),
         },
         Vec::new(),
     ))
@@ -521,13 +758,13 @@ fn point_geometry(node: &Node<'_>) -> Decoded {
 
 fn line(node: &Node<'_>) -> Decoded {
     const NUMBER: &str = "line has a non-finite field";
-    let head = node.head();
+    let body = node.body();
     Ok((
         BestEffortGeometry::Line {
-            start: point(head, 16).ok_or(NUMBER)?,
-            end: point(head, 32).ok_or(NUMBER)?,
-            elevation: number(head, 48).ok_or(NUMBER)?,
-            thickness: number(head, 56).ok_or(NUMBER)?,
+            start: point(body, 0).ok_or(NUMBER)?,
+            end: point(body, 16).ok_or(NUMBER)?,
+            elevation: number(body, 32).ok_or(NUMBER)?,
+            thickness: number(body, 40).ok_or(NUMBER)?,
         },
         Vec::new(),
     ))
@@ -535,41 +772,37 @@ fn line(node: &Node<'_>) -> Decoded {
 
 fn line_3d(node: &Node<'_>) -> Decoded {
     const NUMBER: &str = "3D line has a non-finite coordinate";
-    let head = node.head();
+    let body = node.body();
     let triple = |at| -> Option<[f64; 3]> {
         Some([
-            number(head, at)?,
-            number(head, at + 8)?,
-            number(head, at + 16)?,
+            number(body, at)?,
+            number(body, at + 8)?,
+            number(body, at + 16)?,
         ])
     };
     Ok((
         BestEffortGeometry::Line3D {
-            start: triple(16).ok_or(NUMBER)?,
-            end: triple(40).ok_or(NUMBER)?,
+            start: triple(0).ok_or(NUMBER)?,
+            end: triple(24).ok_or(NUMBER)?,
         },
         Vec::new(),
     ))
 }
 
-fn circle(node: &Node<'_>) -> Decoded {
+fn circle(node: &Node<'_>, marker: u16) -> Decoded {
     const NUMBER: &str = "circle has a non-finite field";
-    let head = node.head();
-    let tail = node
-        .continuation(0)
-        .ok_or("circle has no continuation record")?;
-    let radius = number(tail, 16).ok_or(NUMBER)?;
+    let body = node.body();
+    let tail = node.part(0).ok_or("circle has no continuation record")?;
+    let radius = number(tail, 0).ok_or(NUMBER)?;
     if radius <= 0.0 {
         return Err("circle radius is not positive");
     }
-    let mut fill_state = [0; 16];
-    fill_state.copy_from_slice(&head[32..48]);
     Ok((
         BestEffortGeometry::Circle {
-            center: point(head, 16).ok_or(NUMBER)?,
+            center: point(body, 0).ok_or(NUMBER)?,
             radius,
-            elevation: number(head, 48).ok_or(NUMBER)?,
-            fill_state,
+            elevation: number(body, 32).ok_or(NUMBER)?,
+            fill: shape_fill(tail, marker),
         },
         Vec::new(),
     ))
@@ -577,98 +810,70 @@ fn circle(node: &Node<'_>) -> Decoded {
 
 fn arc(node: &Node<'_>) -> Decoded {
     const NUMBER: &str = "arc has a non-finite field";
-    let head = node.head();
-    let tail = node
-        .continuation(0)
-        .ok_or("arc has no continuation record")?;
-    let radius = number(tail, 16).ok_or(NUMBER)?;
+    let body = node.body();
+    let tail = node.part(0).ok_or("arc has no continuation record")?;
+    let radius = number(tail, 0).ok_or(NUMBER)?;
     if radius <= 0.0 {
         return Err("arc radius is not positive");
     }
     Ok((
         BestEffortGeometry::Arc {
-            center: point(head, 16).ok_or(NUMBER)?,
+            center: point(body, 0).ok_or(NUMBER)?,
             radius,
-            start_degrees: number(tail, 24).ok_or(NUMBER)?,
-            end_degrees: number(tail, 32).ok_or(NUMBER)?,
-            elevation: number(head, 48).ok_or(NUMBER)?,
+            start_degrees: number(tail, 8).ok_or(NUMBER)?,
+            end_degrees: number(tail, 16).ok_or(NUMBER)?,
+            elevation: number(body, 32).ok_or(NUMBER)?,
         },
         Vec::new(),
     ))
 }
 
-fn ellipse(node: &Node<'_>, partial: bool) -> Decoded {
+fn ellipse(node: &Node<'_>, partial: bool, marker: u16) -> Decoded {
     const NUMBER: &str = "ellipse has a non-finite field";
-    let head = node.head();
-    let tail = node
-        .continuation(0)
-        .ok_or("ellipse has no continuation record")?;
-    let center = point(head, 16).ok_or(NUMBER)?;
-    let radius = point(head, 32).ok_or(NUMBER)?;
+    let body = node.body();
+    let tail = node.part(0).ok_or("ellipse has no continuation record")?;
+    let center = point(body, 0).ok_or(NUMBER)?;
+    let radius = point(body, 16).ok_or(NUMBER)?;
     if radius[0] <= 0.0 || radius[1] <= 0.0 {
         return Err("ellipse radius is not positive");
     }
-    let rotation_degrees = number(tail, 16).ok_or(NUMBER)?;
+    let rotation_degrees = number(tail, 0).ok_or(NUMBER)?;
     let geometry = if partial {
         BestEffortGeometry::EllipticalArc {
             center,
             radius,
             rotation_degrees,
-            start_degrees: number(tail, 24).ok_or(NUMBER)?,
-            end_degrees: number(tail, 32).ok_or(NUMBER)?,
+            start_degrees: number(tail, 8).ok_or(NUMBER)?,
+            end_degrees: number(tail, 16).ok_or(NUMBER)?,
         }
     } else {
         BestEffortGeometry::Ellipse {
             center,
             radius,
             rotation_degrees,
+            fill: shape_fill(tail, marker),
         }
     };
     Ok((geometry, Vec::new()))
 }
 
-fn insert(node: &Node<'_>) -> Decoded {
-    const NUMBER: &str = "block reference has a non-finite field";
-    let head = node.head();
-    let tail = node
-        .continuation(0)
-        .ok_or("block reference has no continuation record")?;
-    let name_field = &head[32..];
-    let name_end = name_field
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(name_field.len());
-    let (name, _) = text::shift_jis(name_field);
-    Ok((
-        BestEffortGeometry::Insert {
-            name,
-            name_bytes: name_field[..name_end].to_vec(),
-            position: point(tail, 16).ok_or(NUMBER)?,
-            elevation: number(tail, 32).ok_or(NUMBER)?,
-            scale: point(tail, 40).ok_or(NUMBER)?,
-            rotation_degrees: number(tail, 56).ok_or(NUMBER)?,
-        },
-        Vec::new(),
-    ))
-}
-
 fn arrowhead(node: &Node<'_>) -> Decoded {
     const NUMBER: &str = "arrowhead has a non-finite field";
-    let head = node.head();
+    let body = node.body();
     Ok((
         BestEffortGeometry::Arrowhead {
-            position: point(head, 16).ok_or(NUMBER)?,
-            size: point(head, 32).ok_or(NUMBER)?,
-            angle_degrees: number(head, 48).ok_or(NUMBER)?,
-            arrow_type: head[56],
-            flags_raw: head[57],
+            position: point(body, 0).ok_or(NUMBER)?,
+            size: point(body, 16).ok_or(NUMBER)?,
+            angle_degrees: number(body, 32).ok_or(NUMBER)?,
+            arrow_type: body[40],
+            flags_raw: body[41],
         },
         Vec::new(),
     ))
 }
 
 /// Points of a polyline whose members are one connected run of 2D lines.
-fn control_polygon(members: &[BestEffortEntity]) -> Option<Vec<[f64; 2]>> {
+fn stored_points(members: &[BestEffortEntity]) -> Option<Vec<[f64; 2]>> {
     let mut points = Vec::with_capacity(members.len() + 1);
     for member in members {
         let BestEffortGeometry::Line { start, end, .. } = member.geometry else {
@@ -684,31 +889,15 @@ fn control_polygon(members: &[BestEffortEntity]) -> Option<Vec<[f64; 2]>> {
     (points.len() >= 2).then_some(points)
 }
 
-fn rows(bytes: &[u8], start: u64, count: usize) -> Option<&[u8]> {
-    let start = usize::try_from(start).ok()?;
-    bytes.get(start..start.checked_add(count.checked_mul(RECORD)?)?)
-}
-
-fn layer(index: u16, row: &[u8]) -> BestEffortLayer {
-    let (name, _) = text::shift_jis(&row[32..64]);
-    let flags_raw = short(row, 0);
-    BestEffortLayer {
-        index,
-        name,
-        flags_raw,
-        hidden: flags_raw & 0x0100 != 0,
-        color: short(row, 4),
-        line_type: short(row, 6),
-        width: short(row, 8),
-    }
-}
-
-fn color(index: u16, row: &[u8]) -> BestEffortColor {
-    BestEffortColor {
-        index,
-        rgb: [row[4], row[5], row[6]],
-        pen_width: f64::from(short(row, 2)) / 100.0,
-    }
+fn rows(bytes: &[u8], spec: TableSpec) -> Option<impl Iterator<Item = (u16, &[u8])>> {
+    let start = usize::try_from(spec.start).ok()?;
+    let table = bytes.get(start..start.checked_add(spec.rows.checked_mul(spec.row)?)?)?;
+    Some(
+        table
+            .chunks_exact(spec.row)
+            .enumerate()
+            .map(move |(index, row)| (spec.first + index as u16, row)),
+    )
 }
 
 struct Tables {
@@ -719,38 +908,62 @@ struct Tables {
 }
 
 fn tables(bytes: &[u8], header: &Header, tail: Option<u64>) -> Option<Tables> {
-    let [layer_start, color_start, line_type_start, width_start] = header.tables?;
-    let layer_rows = rows(bytes, layer_start, 255)?;
-    let color_rows = rows(bytes, color_start, 255)?;
-    let line_type_rows = rows(bytes, line_type_start, 32)?;
-    let width_rows = rows(bytes, width_start, 16)?;
-    // The tail extensions hold color 256 and the layers 0 and 256.
-    let extension = |offset: u64| tail.and_then(|tail| rows(bytes, tail + offset, 1));
+    let specs = header.tables.as_ref()?;
+    let unicode = header.layout.unicode;
+    let (name_at, name_size) = specs.layer_name;
+    let layer = |index: u16, row: &[u8]| {
+        let field = &row[name_at..name_at + name_size];
+        let flags_raw = short(row, 0);
+        BestEffortLayer {
+            index,
+            name: if unicode {
+                text::utf16(field).0
+            } else {
+                text::shift_jis(field).0
+            },
+            flags_raw,
+            hidden: flags_raw & 0x0100 != 0,
+            color: short(row, 4),
+            line_type: short(row, 6),
+            width: short(row, 8),
+        }
+    };
+    let color = |index: u16, row: &[u8]| BestEffortColor {
+        index,
+        rgb: [row[4], row[5], row[6]],
+        pen_width: f64::from(short(row, 2)) / 100.0,
+    };
+    // The older layout keeps color 256 and the layers 0 and 256 in its tail.
+    let extension = |offset: u64| {
+        tail.and_then(|tail| {
+            let start = usize::try_from(tail + offset).ok()?;
+            bytes.get(start..start + 64)
+        })
+    };
     let mut layers = Vec::with_capacity(257);
     if let Some(row) = extension(96) {
         layers.push(layer(0, row));
     }
     layers.extend(
-        layer_rows
-            .chunks_exact(RECORD)
-            .zip(1u16..)
-            .map(|(row, index)| layer(index, row)),
+        rows(bytes, specs.layers)?
+            .filter(|(index, _)| *index <= 256)
+            .map(|(index, row)| layer(index, row)),
     );
     if let Some(row) = extension(408) {
         layers.push(layer(256, row));
     }
-    let mut colors: Vec<_> = color_rows
-        .chunks_exact(RECORD)
-        .zip(1u16..)
-        .map(|(row, index)| color(index, row))
+    // The Unicode layout reserves more rows than the application uses; both
+    // layouts return 256 colors, 32 line types and 16 widths.
+    let mut colors: Vec<_> = rows(bytes, specs.colors)?
+        .filter(|(index, _)| (1..=256).contains(index))
+        .map(|(index, row)| color(index, row))
         .collect();
     if let Some(row) = extension(16) {
         colors.push(color(256, row));
     }
-    let line_types = line_type_rows
-        .chunks_exact(RECORD)
-        .zip(1u16..)
-        .map(|(row, index)| {
+    let line_types = rows(bytes, specs.line_types)?
+        .filter(|(index, _)| (1..=32).contains(index))
+        .map(|(index, row)| {
             let mut pattern: Vec<f64> = (0..30)
                 .map(|slot| f64::from(short(row, 4 + slot * 2)) / 100.0)
                 .collect();
@@ -764,10 +977,9 @@ fn tables(bytes: &[u8], header: &Header, tail: Option<u64>) -> Option<Tables> {
             }
         })
         .collect();
-    let widths = width_rows
-        .chunks_exact(RECORD)
-        .zip(1u16..)
-        .map(|(row, index)| BestEffortWidth {
+    let widths = rows(bytes, specs.widths)?
+        .filter(|(index, _)| (1..=16).contains(index))
+        .map(|(index, row)| BestEffortWidth {
             index,
             width: f64::from(short(row, 2)) / 100.0,
         })
@@ -780,7 +992,9 @@ fn tables(bytes: &[u8], header: &Header, tail: Option<u64>) -> Option<Tables> {
     })
 }
 
-fn settings(bytes: &[u8]) -> Option<BestEffortSettings> {
+fn settings(bytes: &[u8], layout: Layout) -> Option<BestEffortSettings> {
+    // The Unicode layout has the same fields 64 bytes further on.
+    let bytes = bytes.get(if layout.unicode { 0x40 } else { 0 }..)?;
     let factor = number(bytes, 0x178)?;
     if factor <= 0.0 {
         return None;
@@ -794,12 +1008,10 @@ fn settings(bytes: &[u8]) -> Option<BestEffortSettings> {
     })
 }
 
-fn table_records(bytes: &[u8], start: u64, count: u64) -> Result<&[u8]> {
-    let size = count
-        .checked_mul(RECORD_SIZE)
-        .ok_or_else(|| invalid("record table extent overflow"))?;
-    let end = start
-        .checked_add(size)
+fn table_records(bytes: &[u8], start: u64, count: u64, record: usize) -> Result<&[u8]> {
+    let end = count
+        .checked_mul(record as u64)
+        .and_then(|size| start.checked_add(size))
         .ok_or_else(|| invalid("record table extent overflow"))?;
     let range = usize::try_from(start).map_err(|_| invalid("record table offset is too large"))?
         ..usize::try_from(end).map_err(|_| invalid("record table offset is too large"))?;
@@ -815,19 +1027,28 @@ pub(crate) fn drawing(
 ) -> Result<BestEffortDrawing> {
     let bytes: &[u8] = &carrier.payload;
     let header = payload::parse_header(bytes, carrier.format, parse_limits)?;
-    let root = table_records(bytes, header.record_start, header.record_count)?;
-    let (root, terminal) = root.split_at(root.len() - RECORD);
+    let layout = header.layout;
+    let root = table_records(
+        bytes,
+        header.record_start,
+        header.record_count,
+        layout.record,
+    )?;
+    let (root, terminal) = root.split_at(root.len() - layout.record);
     if terminal[0] != 0xff {
         return Err(invalid("record table has no terminal record"));
     }
+    // Generations 3 to 25 are the ones the application can save.
+    let marker_observed = (3..=25).contains(&header.marker_raw);
     let mut reader = Reader {
         marker_raw: header.marker_raw,
+        layout,
         limits,
         report: BestEffortReport::default(),
         entities: 0,
         curve_points: 0,
     };
-    if !header.marker_observed {
+    if !marker_observed {
         reader.note(
             "generation_not_observed",
             format!(
@@ -841,8 +1062,9 @@ pub(crate) fn drawing(
     let mut issues = TreeIssues::default();
     let nodes = tree::parse(
         root,
+        layout,
         0,
-        root.len() / RECORD,
+        root.len() / layout.record,
         0,
         limits.max_depth,
         &mut issues,
@@ -856,10 +1078,10 @@ pub(crate) fn drawing(
         limits.max_block_definitions,
         parse_limits.max_records,
     )?;
-    if unbounded {
+    if unbounded && header.block_start != 0 && ranges.is_empty() {
         reader.note(
-            "block_table_end_not_found",
-            "the block table did not end at the expected tail; later definitions and the special layer and color rows are unavailable",
+            "block_definitions_not_read",
+            "the block table does not start with a definition of the known layout",
             None,
             None,
         );
@@ -867,19 +1089,19 @@ pub(crate) fn drawing(
     let mut blocks = Vec::with_capacity(ranges.len());
     for (index, range) in ranges.iter().enumerate() {
         let table = BestEffortTable::Block(index as u64);
-        let records = table_records(bytes, range.record_start, range.record_count)?;
+        let records = table_records(bytes, range.record_start, range.record_count, layout.record)?;
         let nodes = tree::parse(
             records,
+            layout,
             0,
-            records.len() / RECORD,
+            records.len() / layout.record,
             0,
             limits.max_depth,
             &mut issues,
         )?;
-        let (name, _) = text::shift_jis(&range.name_bytes);
         blocks.push(BestEffortBlock {
             index: index as u64,
-            name,
+            name: reader.string(&range.name_bytes),
             name_bytes: range.name_bytes.clone(),
             header_offset: range.header_offset,
             entities: reader.entities(&nodes, table, range.record_start)?,
@@ -892,7 +1114,7 @@ pub(crate) fn drawing(
     if tables.is_none() {
         reader.note(
             "style_tables_not_read",
-            "the layer, color, line-type and width tables do not have the known sizes",
+            "the layer, color, line-type and width tables do not have a known size",
             None,
             None,
         );
@@ -906,11 +1128,11 @@ pub(crate) fn drawing(
     Ok(BestEffortDrawing {
         format: carrier.format,
         marker_raw: header.marker_raw,
-        marker_observed: header.marker_observed,
+        marker_observed,
         payload_size: bytes.len() as u64,
         payload_sha256: carrier.sha256.clone(),
         record_count: header.record_count,
-        settings: settings(bytes),
+        settings: settings(bytes, layout),
         layers: tables.layers,
         colors: tables.colors,
         line_types: tables.line_types,

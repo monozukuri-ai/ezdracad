@@ -12,6 +12,9 @@ pub enum DracadFormat {
     Mpz,
     Mpx,
     Mps,
+    /// Unicode drawing format. Only the best-effort reader produces it; the
+    /// other entry points report such a file as `MpsCandidate`.
+    Mpuw,
     MpsCandidate,
     UnknownCfb,
 }
@@ -23,6 +26,7 @@ impl DracadFormat {
             Self::Mpz => "mpz",
             Self::Mpx => "mpx",
             Self::Mps => "mps",
+            Self::Mpuw => "mpuw",
             Self::MpsCandidate => "mps_candidate",
             Self::UnknownCfb => "unknown_cfb",
         }
