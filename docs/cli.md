@@ -6,11 +6,22 @@ ezdracad inspect drawing.mpz --json
 ezdracad scan drawing.mpx --json
 ezdracad scan drawing.mpz --json --records --start 0 --count 256
 ezdracad extract drawing.mps --entities LINE --partial --json
+ezdracad best-effort drawing.mpz
+ezdracad best-effort drawing.mpz --json --entities
 ```
 
 `inspect` reports carrier and payload metadata. `scan` adds raw record counts
 and optional bounded record or candidate pages. `extract` returns admitted
-entities and a read report.
+entities and a read report. `best-effort` reads every recognized object and
+reports what it skipped.
+
+## Best-effort reading
+
+Without `--json` the command prints the decoded count of every entity type and
+the object kinds it did not decode. With `--json` it prints the drawing header,
+tables, settings, and report; `--entities` adds the entities and block
+definitions. Limits such as `--max-entities N` and `--max-depth N` bound the
+read. See [best-effort reading](format/best-effort.md) for the fields.
 
 ## Extraction options
 
@@ -33,9 +44,9 @@ and diagnostic limits. Every command accepts parse limits such as
 
 | Status | Meaning |
 | --- | --- |
-| `0` | Supported inspection/scan, or complete requested extraction scope |
+| `0` | Supported inspection/scan, complete requested extraction scope, or a best-effort read that skipped nothing |
 | `1` | Malformed input or I/O error |
-| `2` | Unsupported format, partial extraction, or invalid command arguments |
+| `2` | Unsupported format, partial extraction, a best-effort read that skipped objects, or invalid command arguments |
 | `3` | Resource limit exceeded |
 
 Successful and partial result JSON is written to stdout. Error JSON is written

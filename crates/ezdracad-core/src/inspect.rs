@@ -150,6 +150,11 @@ pub fn inspect(data: &[u8], limits: &ParseLimits) -> Result<ContainerInfo> {
 
 /// Inspect a regular file with metadata and actual-byte limits before parsing.
 pub fn inspect_file(path: &Path, limits: &ParseLimits) -> Result<ContainerInfo> {
+    inspect(&read_file_limited(path, limits)?, limits)
+}
+
+/// Read a regular file, checking its metadata and its actual bytes against the limit.
+pub(crate) fn read_file_limited(path: &Path, limits: &ParseLimits) -> Result<Vec<u8>> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() {
         return Err(non_file());
@@ -161,8 +166,7 @@ pub fn inspect_file(path: &Path, limits: &ParseLimits) -> Result<ContainerInfo> 
         return Err(non_file());
     }
     limits.check_file_size(opened.len())?;
-    let bytes = read_limited(&mut file, limits.max_file_size, ReadDomain::File)?;
-    inspect(&bytes, limits)
+    read_limited(&mut file, limits.max_file_size, ReadDomain::File)
 }
 
 fn non_file() -> DracadError {

@@ -7,6 +7,7 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
+mod best_effort_reading;
 mod block3d_scanning;
 mod block_scanning;
 mod coordinate_input_units_scanning;
@@ -208,6 +209,18 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(document_reading::read_file, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        best_effort_reading::best_effort_limit_defaults,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        best_effort_reading::read_best_effort_bytes,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        best_effort_reading::read_best_effort_file,
+        module
+    )?)?;
     module.add_class::<document_reading::DocumentHandle>()?;
     module.add_class::<inspection::ContainerHandle>()?;
     module.add_function(wrap_pyfunction!(scanning::scan_bytes, module)?)?;

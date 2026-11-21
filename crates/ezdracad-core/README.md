@@ -4,7 +4,30 @@ A read-only Rust parser for supported DRA-CAD MPZ, MPX, and unprotected MPS
 encodings. The crate provides container inspection, raw record access, and
 conservative partial geometry decoding. It does not require DRA-CAD at runtime.
 
-## Read a drawing
+## Read everything that is recognized
+
+```rust,no_run
+use ezdracad_core::{read_best_effort_file, BestEffortLimits, ParseLimits, Result};
+use std::path::Path;
+
+fn summary(path: &Path) -> Result<()> {
+    let drawing =
+        read_best_effort_file(path, &ParseLimits::default(), &BestEffortLimits::default())?;
+    for entity in &drawing.entities {
+        println!("{} on layer {}", entity.kind(), entity.attributes.layer);
+    }
+    println!("{:?}", drawing.report.unsupported_counts);
+    Ok(())
+}
+```
+
+`read_best_effort` decodes every object whose saved layout is known, in the
+record generations 5, 8, 10, 22, and 25, and counts the rest by object kind. It
+returns stored coordinates and file-local attribute references, applies no saved
+setting, and makes no claim of completeness. An object that does not fit its
+layout is skipped and counted; malformed tables and exhausted budgets are errors.
+
+## Read with qualification
 
 ```rust,no_run
 use ezdracad_core::{read_file, ReadOptions, ReadPolicy, ReadResult};

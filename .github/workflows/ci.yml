@@ -80,12 +80,15 @@ jobs:
           cp tests/fixtures/basic2d25.cfb fuzz/corpus/read_basic2d/
           mkdir -p fuzz/corpus/read_document
           cp tests/fixtures/document*.cfb tests/fixtures/blocks25.cfb tests/fixtures/semantics25.cfb fuzz/corpus/read_document/
+          mkdir -p fuzz/corpus/read_best_effort
+          cp tests/fixtures/best-effort8.cfb tests/fixtures/best-effort8.bin tests/fixtures/basic2d25.cfb fuzz/corpus/read_best_effort/
       - run: cargo fuzz run scan_contents -- -runs=1000 -max_len=131072 -timeout=5 -rss_limit_mb=1024
       - run: cargo fuzz run scan_mpz -- -runs=1000 -max_len=262144 -timeout=5 -rss_limit_mb=1024
       - run: cargo fuzz run read_document -- -runs=1000 -max_len=262144 -timeout=5 -rss_limit_mb=1024
       - run: cargo fuzz run read_basic2d -- -runs=1000 -max_len=262144 -timeout=5 -rss_limit_mb=1024
       - run: cargo fuzz run read_mps -- -runs=1000 -max_len=262144 -timeout=5 -rss_limit_mb=1024
       - run: cargo fuzz run read_mpx -- -runs=1000 -max_len=262144 -timeout=5 -rss_limit_mb=1024
+      - run: cargo fuzz run read_best_effort -- -runs=1000 -max_len=262144 -timeout=5 -rss_limit_mb=1024
 
   python:
     name: ${{ matrix.os }} / Python ${{ matrix.python }}

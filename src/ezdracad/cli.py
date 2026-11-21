@@ -13,6 +13,7 @@ from . import (
     UnsupportedFeatureError,
     UnsupportedFormatError,
     __version__,
+    best_effort,
     raw,
     readfile,
 )
@@ -67,7 +68,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         extraction.add_argument(
             "--" + option.name.replace("_", "-"), type=int, metavar="N"
         )
-    for command in (inspection, scanning, extraction):
+    reading = subparsers.add_parser(
+        "best-effort",
+        help="read every recognized object and report the rest",
+    )
+    reading.add_argument(
+        "--entities",
+        action="store_true",
+        help="include entities and block definitions in the JSON output",
+    )
+    for option in fields(best_effort.BestEffortLimits):
+        reading.add_argument(
+            "--" + option.name.replace("_", "-"), type=int, metavar="N"
+        )
+    for command in (inspection, scanning, extraction, reading):
         command.add_argument("path")
         command.add_argument("--json", action="store_true", help="print JSON report")
         for option in fields(ParseLimits):
@@ -110,6 +124,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if getattr(args, option.name) is not None
                 }
             )
+        elif args.command == "best-effort":
+            read_limits = best_effort.BestEffortLimits(
+                **{
+                    option.name: getattr(args, option.name)
+                    for option in fields(best_effort.BestEffortLimits)
+                    if getattr(args, option.name) is not None
+                }
+            )
         else:
             read_limits = None
         limits = ParseLimits(
@@ -144,6 +166,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             print(json.dumps(result, sort_keys=True, allow_nan=False))
             return 0 if doc.report.status == ReadStatus.COMPLETE else 2
+        if args.command == "best-effort":
+            drawing = best_effort.readfile(
+                args.path, limits=limits, read_limits=read_limits
+            )
+            report = drawing.report
+            if args.json:
+                print(
+                    json.dumps(
+                        drawing.to_dict(include_entities=args.entities),
+                        sort_keys=True,
+                        allow_nan=False,
+                    )
+                )
+            else:
+                print(f"Format: {drawing.format}, raw marker {drawing.marker}")
+                for name, count in sorted(report.decoded_counts.items()):
+                    print(f"{name}: {count}")
+                for tag, count in sorted(report.unsupported_counts.items()):
+                    print(f"not decoded, object kind {tag}: {count}")
+                for tag, count in sorted(report.failed_counts.items()):
+                    print(f"skipped, object kind {tag}: {count}")
+                if report.orphan_records or report.clamped_spans:
+                    print(
+                        f"stray continuation records: {report.orphan_records}; "
+                        f"objects cut at their parent: {report.clamped_spans}"
+                    )
+            return 2 if report.lossy else 0
         if args.command == "scan":
             scan = raw.scanfile(args.path, limits=limits)
             if args.start > scan.header.record_count:

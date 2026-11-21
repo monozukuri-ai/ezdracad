@@ -1,5 +1,25 @@
 # User guide
 
+## Choose a reader
+
+`ezdracad.best_effort.readfile` decodes every object whose saved layout is known
+and reports the rest by count. It reads older and newer record generations and is
+the reader to use for display or conversion.
+
+```python
+from ezdracad import best_effort
+
+drawing = best_effort.readfile("drawing.mpz")
+print(drawing.report.decoded_counts, drawing.report.lossy)
+for entity in drawing.walk():
+    print(entity.type, entity.data)
+```
+
+`ezdracad.readfile` is the qualified reader described below. It returns only
+objects whose meaning it can establish and blocks the objects after an unknown
+one. Use it when a wrong interpretation is worse than a missing one. The two
+readers are independent; see [best-effort reading](format/best-effort.md).
+
 ## Read policies
 
 ```python

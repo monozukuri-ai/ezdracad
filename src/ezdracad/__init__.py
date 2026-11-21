@@ -2,7 +2,7 @@
 
 from importlib.metadata import version
 
-from . import raw
+from . import best_effort, raw
 from ._core import (
     DracadError,
     DracadIoError,
@@ -43,6 +43,7 @@ __all__ = [
     "UnsupportedFeatureError",
     "UnsupportedFormatError",
     "__version__",
+    "best_effort",
     "raw",
     "Document",
     "ArcEntity",

@@ -5,6 +5,7 @@ Start with the [user guide](usage.md), [CLI reference](cli.md), and
 
 ## Data access
 
+- [Best-effort reading of every recognized object](format/best-effort.md)
 - [Raw inspection, records, and source locations](raw-api.md)
 - [Documents, read policies, and queries](format/document-reader.md)
 - [Stored-XY line profile](format/line2d-profile.md)

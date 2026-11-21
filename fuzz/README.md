@@ -1,6 +1,6 @@
 # Fuzzing
 
-The six targets accept arbitrary input bytes with bounded parse and read limits.
+The seven targets accept arbitrary input bytes with bounded parse and read limits.
 Successful parses additionally check source ranges, hash retention, and
 strict/partial behavior.
 
@@ -12,6 +12,7 @@ strict/partial behavior.
 | `read_basic2d` | `basic2d25.cfb` |
 | `read_mpx` | `mpx*.mpx` |
 | `read_mps` | `mps-*.mps` |
+| `read_best_effort` | `best-effort8.cfb`, `best-effort8.bin`, `basic2d25.cfb` |
 
 Use nightly Rust and `cargo-fuzz`:
 

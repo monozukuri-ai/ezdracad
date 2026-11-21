@@ -3,7 +3,7 @@ members = ["crates/ezdracad-core", "crates/ezdracad-python"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2021"
 rust-version = "1.83"
 authors = ["neka-nat <nekanat.stock@gmail.com>"]
@@ -12,6 +12,9 @@ license = "PolyForm-Noncommercial-1.0.0"
 
 [workspace.dependencies]
 cfb = "0.14.0"
+# Older record generations store Shift_JIS strings. encoding_rs 0.8.40 and later
+# need a newer compiler than this workspace's minimum.
+encoding_rs = ">=0.8.31, <0.8.40"
 flate2 = { version = "1.1.9", default-features = false, features = ["miniz_oxide"] }
 pyo3 = { version = "0.29.0", features = ["abi3-py310"] }
 thiserror = "2.0"

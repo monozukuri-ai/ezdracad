@@ -17,7 +17,17 @@ A raw marker is not an application release number.
 
 ## Geometry support
 
-The high-level reader is conservative and partial. The default line profile
+Two readers have different boundaries. The [best-effort reader](format/best-effort.md)
+decodes points, lines, circles, arcs, ellipses, text, polylines, cubic splines,
+extended polygons, hatches by line families, dimensions, packages, arrowheads,
+and block placements in the record generations 5, 8, 10, 22, and 25, including
+flat MPX of those generations. It counts images, external references, layouts,
+viewports, three-dimensional solids, and any other object kind without decoding
+them. Named hatch patterns, quadratic and Bezier curves, and the fill of circles
+and ellipses are reported without being evaluated. Its output is the stored
+state, with no claim of completeness.
+
+The qualified high-level reader is conservative and partial. The default line profile
 admits bounded planar stored-XY line and placement forms. An optional profile
 adds root circles, arcs, and literal text. Unsupported objects or context can
 block subsequent root objects. Re-saving a file can change opaque fields and

@@ -2,10 +2,12 @@
 
 A read-only DRA-CAD parser with a Rust core and Python bindings.
 
-`ezdracad` inspects MPZ, observed marker-25 MPX, and two supported unprotected
-MPS encodings. It exposes raw records and a conservative subset of lines,
-block placements, root circles, arcs, and literal text. DRA-CAD is not required
-at runtime.
+`ezdracad` inspects MPZ, flat MPX, and two supported unprotected MPS encodings.
+It offers two ways to read a drawing. The best-effort reader decodes every
+object whose saved layout is known, in older and newer record generations, and
+counts what it skipped. The qualified reader returns a conservative subset of
+lines, block placements, root circles, arcs, and literal text, and stops where
+it cannot establish the meaning. DRA-CAD is not required at runtime.
 
 This is alpha software with partial format support. A successful inspection
 or extraction does not establish complete drawing semantics, physical units,
@@ -24,7 +26,26 @@ python -m pip install .
 The Python package has no runtime Python dependencies. The native extension
 contains the parser; MPS decompression uses a Rust backend.
 
-## Read a drawing
+## Read everything that is recognized
+
+```python
+from ezdracad import best_effort
+
+drawing = best_effort.readfile("drawing.mpz")
+for entity in drawing.walk():
+    print(entity.type, entity.layer, entity.data)
+
+print(drawing.report.decoded_counts)
+print(drawing.report.unsupported_counts, drawing.report.failed_counts)
+```
+
+Lines, circles, arcs, ellipses, text, polylines with spline curves, hatches,
+dimensions, packages, and block placements are returned with their layer, color,
+line-type, and width references. Objects of other kinds are counted, not
+guessed. Coordinates are the stored values; saved settings are reported and not
+applied. See [best-effort reading](docs/format/best-effort.md).
+
+## Read with qualification
 
 ```python
 import ezdracad
@@ -78,6 +99,7 @@ See [compatibility](docs/compatibility.md) before interpreting results.
 ezdracad inspect drawing.mpz --json
 ezdracad scan drawing.mpx --json
 ezdracad extract drawing.mpz --entities LINE --partial --json
+ezdracad best-effort drawing.mpz --json --entities
 ```
 
 Exit status is `0` for success within the requested scope, `2` for an unsupported
@@ -90,6 +112,7 @@ limit. Extraction scripts should accept status `2` when requesting partial outpu
 - [Command-line reference](docs/cli.md)
 - [Compatibility and limitations](docs/compatibility.md)
 - [Raw inspection and source locations](docs/raw-api.md)
+- [Best-effort reading](docs/format/best-effort.md)
 - [Advanced profiles](docs/README.md)
 - [Contributing](CONTRIBUTING.md)
 

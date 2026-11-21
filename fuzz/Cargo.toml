@@ -56,3 +56,10 @@ path = "fuzz_targets/read_mps.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "read_best_effort"
+path = "fuzz_targets/read_best_effort.rs"
+test = false
+doc = false
+bench = false
