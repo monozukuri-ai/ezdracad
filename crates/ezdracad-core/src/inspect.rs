@@ -13,13 +13,18 @@ use crate::{
     Result, DRACAD_CLSID,
 };
 
+/// Root storage class identifier of a compound file that never had one set.
+const NIL_CLSID: &str = "00000000-0000-0000-0000-000000000000";
+
 /// Identify a supported carrier and retain exact MPZ Contents or flat MPX bytes.
 pub fn inspect(data: &[u8], limits: &ParseLimits) -> Result<ContainerInfo> {
     inspect_with(data, limits, false)
 }
 
 /// As [`inspect`]; with `unicode` set, the envelopes of the Unicode drawing
-/// format are decoded too and reported as [`DracadFormat::Mpuw`].
+/// format are decoded too and reported as [`DracadFormat::Mpuw`], and a
+/// compound file without a class identifier on its root storage is accepted
+/// when its drawing stream identifies itself. Older releases saved such files.
 pub(crate) fn inspect_with(
     data: &[u8],
     limits: &ParseLimits,
@@ -47,13 +52,13 @@ pub(crate) fn inspect_with(
         diagnostics: Vec::new(),
         contents: None,
     };
-    if info
+    let root_clsid = &info
         .cfb
         .as_ref()
         .ok_or_else(|| invalid("missing CFB metadata"))?
-        .root_clsid
-        != DRACAD_CLSID
-    {
+        .root_clsid;
+    let anonymous = unicode && root_clsid == NIL_CLSID;
+    if root_clsid != DRACAD_CLSID && !anonymous {
         info.diagnostics.push(Diagnostic {
             code: "unrecognized_clsid",
             message: "CFB root CLSID is not the observed DRA-CAD CLSID; no drawing identified"
@@ -130,10 +135,16 @@ pub(crate) fn inspect_with(
     if bytes.len() as u64 != declared_size {
         return Err(invalid("Contents length differs from declared stream size"));
     }
-    if bytes.len() < 0x24
-        || !bytes.starts_with(DRAWING_MAGIC)
-        || bytes[DRAWING_MAGIC.len()..32].iter().any(|byte| *byte != 0)
-    {
+    if bytes.len() < 0x24 || !crate::format::has_drawing_identifier(&bytes, !unicode) {
+        if anonymous {
+            // Other programs name a stream Contents too; without the class
+            // identifier this is simply not a drawing.
+            info.diagnostics.push(Diagnostic {
+                code: "unrecognized_clsid",
+                message: "CFB root has no class identifier and Contents is not a drawing".into(),
+            });
+            return Ok(info);
+        }
         return Err(invalid(
             "Contents has no complete supported DRA-CAD identifier/header prefix",
         ));

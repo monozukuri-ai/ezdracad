@@ -7,6 +7,18 @@ use crate::{CfbInfo, DracadError, Result};
 pub const DRACAD_CLSID: &str = "0d4c9b60-7843-11cf-1234-56789abcdeff";
 pub(crate) const DRAWING_MAGIC: &[u8] = b"DRACAD for Windows";
 
+/// Whether `bytes` begin with the drawing identifier.
+///
+/// The identifier is a terminated string in a 32-byte field. Most drawings
+/// zero the rest of the field, which `strict` requires; saved drawings exist
+/// where the bytes after the terminator are leftovers.
+pub(crate) fn has_drawing_identifier(bytes: &[u8], strict: bool) -> bool {
+    bytes.len() >= 32
+        && bytes.starts_with(DRAWING_MAGIC)
+        && bytes[DRAWING_MAGIC.len()] == 0
+        && (!strict || bytes[DRAWING_MAGIC.len()..32].iter().all(|byte| *byte == 0))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DracadFormat {
     Mpz,

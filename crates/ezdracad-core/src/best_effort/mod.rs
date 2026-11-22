@@ -82,7 +82,8 @@ pub struct BestEffortSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BestEffortAttributes {
     pub tag_raw: u16,
-    /// High byte of the tag: 0x02 hidden, 0x08 polyline member.
+    /// High byte of the tag: 0x08 polyline member, 0x10 with it a reversed
+    /// member arc. The other bits are kept without a meaning.
     pub flags_raw: u8,
     /// Layer number 0..=256.
     pub layer: u16,
@@ -99,10 +100,6 @@ pub struct BestEffortAttributes {
 }
 
 impl BestEffortAttributes {
-    #[must_use]
-    pub const fn hidden(&self) -> bool {
-        self.flags_raw & 0x02 != 0
-    }
     #[must_use]
     pub const fn polyline_member(&self) -> bool {
         self.flags_raw & 0x08 != 0
@@ -121,7 +118,7 @@ pub struct BestEffortFill {
     /// 1..=256 palette entry, 257 the explicit `rgb`, 258 the background color.
     pub color: u16,
     pub rgb: [u8; 3],
-    /// Transparency in percent.
+    /// 0 opaque to 255 fully transparent.
     pub transparency: u8,
     /// Whether the outline is drawn as well as the fill.
     pub outline: bool,
@@ -138,10 +135,15 @@ pub struct BestEffortText {
     /// Stored bytes without the terminator: Shift_JIS, or UTF-16 code units in
     /// the Unicode drawing format.
     pub text_bytes: Vec<u8>,
-    /// Character cell height and width as saved, without physical units.
+    /// Character cell height, and the advance of one character or zero for
+    /// the natural width of the font. See `output_size` for their unit.
     pub height: f64,
     pub width: f64,
     pub spacing: f64,
+    /// The sizes are millimetres on the output sheet: multiply `height`,
+    /// `width` and `spacing` by the drawing scale to get drawing units.
+    /// Otherwise they are drawing units already.
+    pub output_size: bool,
     pub rotation_degrees: f64,
     pub slant_degrees: f64,
     /// Horizontal position in the low two bits (0 left, 1 center, 2 right),
@@ -173,8 +175,9 @@ pub struct BestEffortHatchLine {
     pub width: u16,
 }
 
-/// A named hatch pattern. The pattern lines live in the application's pattern
-/// library, not in the drawing; `values` are its saved placement numbers.
+/// A named hatch pattern of the application's pattern library; `values` are
+/// its saved placement numbers. The lines drawn for it are the members of the
+/// package with kind 5 and the reference number of the hatched region.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BestEffortHatchPattern {
     pub name: String,
@@ -183,6 +186,18 @@ pub struct BestEffortHatchPattern {
     pub color: u16,
     pub line_type: u16,
     pub width: u16,
+}
+
+/// A gradation hatch: the color runs from `rgb_start` at `start` to `rgb_end`
+/// at `end`. The package of the hatch holds it as filled bands of one color
+/// each, which is what the application draws.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BestEffortGradation {
+    pub start: [f64; 2],
+    pub end: [f64; 2],
+    pub rgb_start: [u8; 3],
+    pub rgb_end: [u8; 3],
+    pub gradation_type: u8,
 }
 
 /// Arc of an angle dimension.
@@ -277,6 +292,9 @@ pub enum BestEffortGeometry {
         /// outer boundary.
         hole_count: u16,
         link_id: u32,
+        /// Name of the region when it is a named area, such as a room; a child
+        /// text draws its label.
+        name: String,
     },
     /// Hatching of the extended polygon with the same `link_id`.
     Hatch {
@@ -285,6 +303,7 @@ pub enum BestEffortGeometry {
         link_id: u32,
         lines: Vec<BestEffortHatchLine>,
         pattern: Option<BestEffortHatchPattern>,
+        gradation: Option<BestEffortGradation>,
     },
     /// The measured geometry. The numeric text is a child; the drawn lines,
     /// arrowheads and text are members of a package with the same `link_id`.
@@ -322,13 +341,19 @@ pub enum BestEffortGeometry {
         flags_raw: u8,
         reference_number: u32,
     },
+    /// A terminator of a dimension or leader line. `position` is the tip; the
+    /// shape points along `angle_degrees` and extends back from the tip.
     Arrowhead {
         position: [f64; 2],
+        /// Width across the line, then length along it.
         size: [f64; 2],
         angle_degrees: f64,
-        /// 0 none, 1 origin mark, 2 and 3 dots, 4 to 7 arrows, 8 to 10 boxes,
-        /// 11 slash, 12 integral sign.
+        /// 0 none; 1 and 2 circle, 3 filled circle; 4 open arrow, 5 and 6
+        /// closed arrow, 7 filled arrow; 8 and 9 square, 10 filled square;
+        /// 11 slash; 12 integral sign; 13 half open arrow, 14 half closed
+        /// arrow, 15 half filled arrow.
         arrow_type: u8,
+        /// 0x80: `size` is millimetres on the output sheet.
         flags_raw: u8,
     },
     /// A placed raster image, kept as a reference to its file.
@@ -344,6 +369,9 @@ pub enum BestEffortGeometry {
     },
     /// Another drawing shown inside this one, kept as a reference to its file.
     ExternalReference {
+        /// Whether the file is placed as a part, like a block reference; the
+        /// other references lay a whole drawing under this one.
+        symbol: bool,
         file_name: String,
         directory: String,
         relative_directory: String,
@@ -351,6 +379,45 @@ pub enum BestEffortGeometry {
         elevation: f64,
         scale: [f64; 2],
         rotation_degrees: f64,
+    },
+    /// A sheet of the drawing next to its model: paper with windows onto the
+    /// model. Objects whose `segment` is the number of the sheet are drawn on
+    /// it, in millimetres from its lower left corner; the others are the model.
+    Layout {
+        number: u16,
+        name: String,
+        /// Paper size code, as in the drawing settings.
+        paper_type: u16,
+        /// Paper width and height in millimetres.
+        paper_size: [f64; 2],
+    },
+    /// A window of a sheet onto the model. Its `segment` names the sheet.
+    Viewport {
+        flags_raw: u8,
+        /// A point of the sheet and the model point shown there.
+        paper_point: [f64; 2],
+        model_point: [f64; 2],
+        /// Sheet length per model length along x and y: 0.02 for 1:50.
+        scale: [f64; 2],
+        /// Rotation of the model inside the window, counter-clockwise.
+        rotation_degrees: f64,
+        /// Center and half extents of a rectangular window on the sheet.
+        window: Option<[[f64; 2]; 2]>,
+    },
+    /// A face in space with holes. The first child polyline is its outer
+    /// boundary and carries the fill; the next `hole_count` polylines cut holes.
+    Polygon3D {
+        hole_count: u16,
+    },
+    /// A viewpoint saved for perspective views. It is no part of the drawing.
+    Camera {
+        position: [f64; 3],
+        target: [f64; 3],
+    },
+    /// A light source for rendering. It is no part of the drawing.
+    Light {
+        position: [f64; 3],
+        target: [f64; 3],
     },
 }
 
@@ -376,6 +443,11 @@ impl BestEffortGeometry {
             Self::Arrowhead { .. } => "ARROWHEAD",
             Self::Image { .. } => "IMAGE",
             Self::ExternalReference { .. } => "EXTERNAL_REFERENCE",
+            Self::Layout { .. } => "LAYOUT",
+            Self::Viewport { .. } => "VIEWPORT",
+            Self::Polygon3D { .. } => "POLYGON_3D",
+            Self::Camera { .. } => "CAMERA",
+            Self::Light { .. } => "LIGHT",
         }
     }
 }
@@ -441,7 +513,7 @@ pub struct BestEffortWidth {
 }
 
 /// Saved drawing settings. They are not applied to any coordinate.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BestEffortSettings {
     pub drawing_origin: [f64; 2],
     /// Denominator of the saved paper scale (100 for 1:100).
@@ -450,6 +522,41 @@ pub struct BestEffortSettings {
     pub paper_size: [f64; 2],
     /// Top-left corner of the paper in stored coordinates.
     pub paper_origin: [f64; 2],
+    /// Saved paper size code: 0 a free size, 1 to 7 A0 to A6, 8 to 14 B0 to
+    /// B6, 15 letter, 16 legal.
+    pub paper_type: u32,
+    /// Whether the paper stands upright.
+    pub paper_portrait: bool,
+    /// Factor between the paper scale and the scale the drawing states in its
+    /// scale field; 1 in most drawings. A sheet drawn at full size for
+    /// drawings at 1:100 saves 0.01.
+    pub scale_ratio: f64,
+    /// Comment of the drawing, empty when there is none.
+    pub comment: String,
+    /// Whether the drawing is printed with the pen width of each color
+    /// instead of the width of each object.
+    pub width_by_color: bool,
+}
+
+impl BestEffortSettings {
+    /// Denominator of the scale the drawing states: `drawing_scale / scale_ratio`.
+    #[must_use]
+    pub fn stated_scale(&self) -> f64 {
+        self.drawing_scale / self.scale_ratio
+    }
+}
+
+/// A property saved with the drawing. Properties carry no geometry; the
+/// application keeps its own bookkeeping in them, and the values that
+/// property-set fields of texts print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BestEffortProperty {
+    pub source: BestEffortSource,
+    pub owner: String,
+    pub name: String,
+    pub value: String,
+    /// Whether a string held bytes outside its encoding.
+    pub lossy: bool,
 }
 
 /// A note about one object or table. `tag_raw` is absent for table notes.
@@ -472,6 +579,8 @@ pub struct BestEffortReport {
     pub failed_counts: BTreeMap<u8, u64>,
     /// Non-graphic property records, which carry no geometry.
     pub property_records: u64,
+    /// Objects the application had erased; their records stay in the table.
+    pub erased_objects: u64,
     /// Continuation records that belonged to no object.
     pub orphan_records: u64,
     /// Objects whose declared length ran past their parent and was cut there.
@@ -509,6 +618,8 @@ pub struct BestEffortDrawing {
     pub widths: Vec<BestEffortWidth>,
     pub blocks: Vec<BestEffortBlock>,
     pub entities: Vec<BestEffortEntity>,
+    /// Properties of every table, in file order.
+    pub properties: Vec<BestEffortProperty>,
     pub report: BestEffortReport,
 }
 

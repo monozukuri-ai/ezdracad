@@ -71,6 +71,10 @@ pub(crate) fn decode_envelope(
         _ => return Ok(None),
     };
     prefix[18] = kind as u8;
+    // Some saved drawings set a further switch here; they open like the others.
+    if unicode && bytes[16] == 1 {
+        prefix[16] = 1;
+    }
     if bytes[..122] != prefix {
         return Ok(None);
     }
@@ -106,12 +110,7 @@ pub(crate) fn decode_envelope(
         ));
     }
     let output = inflate(&bytes[start..], decoded, limits.max_decompressed_size)?;
-    if output.len() < 84
-        || !output.starts_with(crate::format::DRAWING_MAGIC)
-        || output[crate::format::DRAWING_MAGIC.len()..32]
-            .iter()
-            .any(|&x| x != 0)
-    {
+    if output.len() < 84 || !crate::format::has_drawing_identifier(&output, !unicode) {
         return Err(invalid(
             "MPS decoded payload has no supported DRA-CAD prefix",
         ));

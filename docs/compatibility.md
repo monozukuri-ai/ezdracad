@@ -20,15 +20,19 @@ A raw marker is not an application release number.
 
 Two readers have different boundaries. The [best-effort reader](format/best-effort.md)
 decodes points, lines, circles, arcs, ellipses, text, polylines, quadratic and
-cubic splines, Bezier curves, fills, extended polygons, hatches, dimensions,
-leaders, packages, arrowheads, block placements, and references to images and
-other drawings. It reads the raw markers 3 to 25, which are the generations the
-application can save, in MPZ, flat MPX, MPS, and MPUW input. It counts layouts,
-viewports, three-dimensional solids, and any other object kind without decoding
-them. A named hatch pattern is returned by name and saved numbers; its lines
-belong to the pattern library of the application and are not in the drawing.
-Gradation hatches, image contents, and referenced drawings are not read. Its
-output is the stored state, with no claim of completeness.
+cubic splines, Bezier curves, fills, extended polygons, named areas, hatches,
+dimensions, leaders, packages, arrowheads, block placements, references to
+images and other drawings, sheets with their viewports, faces in space with
+holes, cameras, and lights. It reads the raw markers 3 to 25, which are the
+generations the application can save, and marker 1 of the oldest part
+libraries, in MPZ, flat MPX, MPS, and MPUW input, including compound files that
+older releases saved without a class identifier. It also returns the drawing
+comment, the paper, the stated scale, and the properties that text fields
+print. Any other object kind is counted without being decoded. A hatch is
+returned as its definition and as what the application drew and saved for it:
+the lines of a named pattern of the pattern library, or the color bands of a
+gradation. Image contents and referenced drawings are not read. Its output is
+the stored state, with no claim of completeness.
 
 The qualified high-level reader is conservative and partial. The default line profile
 admits bounded planar stored-XY line and placement forms. An optional profile

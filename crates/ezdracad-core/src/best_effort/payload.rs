@@ -38,6 +38,9 @@ pub(crate) struct TableSpecs {
     pub widths: TableSpec,
     /// Offset and length of the name field of a layer row.
     pub layer_name: (usize, usize),
+    /// The tables of the first releases: fewer rows, no layer widths, and
+    /// leftover bytes wherever a row has no field.
+    pub early: bool,
 }
 
 pub(crate) struct Header {
@@ -122,6 +125,16 @@ fn table_specs(sections: &[u64; 7], layout: Layout) -> Option<TableSpecs> {
             line_types: spec(2, 32, 64, 1),
             widths: spec(3, 16, 64, 1),
             layer_name: (32, 32),
+            early: false,
+        })
+    } else if !layout.unicode && sizes == [12800, 2048, 1024, 1024] {
+        Some(TableSpecs {
+            layers: spec(0, 200, 64, 1),
+            colors: spec(1, 32, 64, 1),
+            line_types: spec(2, 16, 64, 1),
+            widths: spec(3, 16, 64, 1),
+            layer_name: (32, 32),
+            early: true,
         })
     } else if layout.unicode && sizes == [282_624, 24_768, 141_312, 24_576] {
         Some(TableSpecs {
@@ -130,6 +143,7 @@ fn table_specs(sections: &[u64; 7], layout: Layout) -> Option<TableSpecs> {
             line_types: spec(2, 256, 552, 0),
             widths: spec(3, 256, 96, 0),
             layer_name: (32, 520),
+            early: false,
         })
     } else {
         None
@@ -141,10 +155,7 @@ pub(crate) fn parse_header(
     format: DracadFormat,
     limits: &ParseLimits,
 ) -> Result<Header> {
-    if bytes.len() < 0x5c
-        || !bytes.starts_with(DRAWING_MAGIC)
-        || bytes[DRAWING_MAGIC.len()..32].iter().any(|byte| *byte != 0)
-    {
+    if bytes.len() < 0x5c || !crate::format::has_drawing_identifier(bytes, false) {
         return Err(invalid("payload lacks a complete DRA-CAD header"));
     }
     let length = bytes.len() as u64;

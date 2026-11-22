@@ -199,6 +199,35 @@ fn parse_code(code: &str) -> Option<(&str, &str, usize)> {
     Some((name, content, 2 + content_start + content_length + 2))
 }
 
+/// Replace every `{\uni"XXXX"}` by the character it names and keep the rest.
+///
+/// Names and values outside the texts of a drawing use this escape for
+/// characters their encoding lacks, and no formatting codes.
+pub(crate) fn unescape(source: &str) -> String {
+    const OPEN: &str = "{\\uni\"";
+    let mut result = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(at) = rest.find(OPEN) {
+        let after = &rest[at + OPEN.len()..];
+        let character = after
+            .find("\"}")
+            .and_then(|end| Some((unicode_escape(&after[..end])?, end)));
+        match character {
+            Some((character, end)) => {
+                result.push_str(&rest[..at]);
+                result.push(character);
+                rest = &after[end + 2..];
+            }
+            None => {
+                result.push_str(&rest[..at + OPEN.len()]);
+                rest = after;
+            }
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
 fn unicode_escape(content: &str) -> Option<char> {
     if !(4..=6).contains(&content.len()) || !content.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;

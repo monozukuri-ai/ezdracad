@@ -41,10 +41,12 @@ print(drawing.report.unsupported_counts, drawing.report.failed_counts)
 ```
 
 Lines, circles, arcs, ellipses, text, polylines with spline and Bezier curves,
-fills, regions, hatches, dimensions, leaders, packages, block placements, and
-references to images and other drawings are returned with their layer, color,
-line-type, and width references. Objects of other kinds are counted, not
-guessed. Coordinates are the stored values; saved settings are reported and not
+fills, regions, hatches, dimensions, leaders, packages, block placements,
+references to images and other drawings, sheets with their viewports, and the
+faces of a model are returned with their layer, color, line-type, and width
+references. The comment, the paper, the scales, and the properties that text
+fields print come with them. Objects of other kinds are counted, not guessed.
+Coordinates are the stored values; saved settings are reported and not
 applied. See [best-effort reading](docs/format/best-effort.md).
 
 ## Read with qualification

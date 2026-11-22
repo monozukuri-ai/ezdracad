@@ -14,12 +14,13 @@ use super::tree::{self, Layout, Node, TreeIssues};
 use super::{
     text, BestEffortAttributes, BestEffortBlock, BestEffortColor, BestEffortDiagnostic,
     BestEffortDimensionArc, BestEffortDrawing, BestEffortEntity, BestEffortFill,
-    BestEffortGeometry, BestEffortHatchLine, BestEffortHatchPattern, BestEffortLayer,
-    BestEffortLimits, BestEffortLineType, BestEffortReport, BestEffortSettings, BestEffortSource,
-    BestEffortTable, BestEffortText, BestEffortWidth,
+    BestEffortGeometry, BestEffortGradation, BestEffortHatchLine, BestEffortHatchPattern,
+    BestEffortLayer, BestEffortLimits, BestEffortLineType, BestEffortProperty, BestEffortReport,
+    BestEffortSettings, BestEffortSource, BestEffortTable, BestEffortText, BestEffortWidth,
 };
 
 // Object kinds, the low byte of a primary tag.
+const ERASED: u8 = 0;
 const POINT: u8 = 1;
 const LINE: u8 = 2;
 const CIRCLE: u8 = 3;
@@ -34,12 +35,20 @@ const HATCH: u8 = 13;
 const POLYLINE_3D: u8 = 18;
 const LINE_3D: u8 = 19;
 const NUMERIC_TEXT: u8 = 20;
+const POLYGON_3D: u8 = 22;
+const SYMBOL: u8 = 23;
 const OVERLAY: u8 = 24;
 const IMAGE: u8 = 25;
 const DIMENSION: u8 = 26;
 const LEADER: u8 = 27;
+const VIEWPORT: u8 = 29;
+const LAYOUT: u8 = 30;
 const PACKAGE: u8 = 48;
+const CAMERA: u8 = 49;
+const LIGHT: u8 = 50;
 const PROPERTY: u8 = 51;
+/// Properties as drawings of the first releases keep them.
+const EARLY_PROPERTY: u8 = 63;
 const ARROWHEAD: u8 = 52;
 // Parts that only occur inside their owning object.
 const DIMENSION_LINE: u8 = 0x41;
@@ -53,6 +62,14 @@ const HATCH_LINE: u8 = 0x4b;
 const HATCH_PATTERN: u8 = 0x4c;
 const HATCH_PATTERN_VALUES: u8 = 0x4d;
 const HATCH_PATTERN_NAME: u8 = 0x4e;
+const HATCH_GRADATION: u8 = 0x4f;
+const LAYOUT_NAME: u8 = 0x51;
+const VIEWPORT_WINDOW: u8 = 0x52;
+// Attributes of a named area inside its extended polygon.
+const AREA_IDENTITY: u8 = 0x56;
+const AREA_ORIGIN: u8 = 0x57;
+const AREA_NAME: u8 = 0x58;
+const AREA_SCALE: u8 = 0x5e;
 const DIMENSION_PAPER_ARROWS: u8 = 0x50;
 
 const CLOSED: u8 = 0x01;
@@ -76,6 +93,69 @@ fn point(bytes: &[u8], at: usize) -> Option<[f64; 2]> {
     Some([number(bytes, at)?, number(bytes, at + 8)?])
 }
 
+/// Kind of a file placed in the drawing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placed {
+    Image,
+    Overlay,
+    Symbol,
+}
+
+/// A window of a sheet: where it shows the model, and its rectangle.
+fn viewport(node: &Node<'_>) -> Decoded {
+    const SHORT: &str = "viewport has no continuation record";
+    const NUMBER: &str = "viewport has a non-finite field";
+    let body = node.body();
+    let view = node.part(0).ok_or(SHORT)?;
+    let window = match node
+        .children
+        .iter()
+        .find(|child| child.tag as u8 == VIEWPORT_WINDOW)
+    {
+        Some(child) => {
+            let part = child.plain();
+            Some([
+                point(part, 0).ok_or(NUMBER)?,
+                point(part, 16).ok_or(NUMBER)?,
+            ])
+        }
+        None => None,
+    };
+    Ok((
+        BestEffortGeometry::Viewport {
+            flags_raw: body[1],
+            paper_point: point(body, 32).ok_or(NUMBER)?,
+            model_point: point(view, 0).ok_or(NUMBER)?,
+            scale: point(view, 16).ok_or(NUMBER)?,
+            rotation_degrees: number(view, 32).ok_or(NUMBER)?,
+            window,
+        },
+        Vec::new(),
+    ))
+}
+
+/// A camera or a light: where it stands and what it looks at.
+fn sight(node: &Node<'_>) -> Decoded {
+    const SHORT: &str = "camera or light has no continuation record";
+    const NUMBER: &str = "camera or light has a non-finite field";
+    let part = node.part(0).ok_or(SHORT)?;
+    let triple = |at: usize| -> Option<[f64; 3]> {
+        Some([
+            number(part, at)?,
+            number(part, at + 8)?,
+            number(part, at + 16)?,
+        ])
+    };
+    let position = triple(0).ok_or(NUMBER)?;
+    let target = triple(24).ok_or(NUMBER)?;
+    let geometry = if node.tag as u8 == CAMERA {
+        BestEffortGeometry::Camera { position, target }
+    } else {
+        BestEffortGeometry::Light { position, target }
+    };
+    Ok((geometry, Vec::new()))
+}
+
 fn short(bytes: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([bytes[at], bytes[at + 1]])
 }
@@ -87,19 +167,25 @@ fn long(bytes: &[u8], at: usize) -> u32 {
 fn attributes(record: &[u8], layout: Layout) -> BestEffortAttributes {
     let tag_raw = short(record, 0);
     let flags_raw = (tag_raw >> 8) as u8;
-    let (layer_raw, color_raw, line_type, width, material, group, link_id) = if layout.unicode {
+    // The older layout packs the sheet number above the nine bits of the
+    // layer; the Unicode layout has a byte for it.
+    let (layer, segment, color_raw, line_type, width, material, group, link_id) = if layout.unicode
+    {
         (
             short(record, 10),
+            record[3],
             long(record, 4).min(u32::from(u16::MAX)) as u16,
             record[8],
             record[9],
-            0,
+            record[2],
             short(record, 16),
             short(record, 20),
         )
     } else {
+        let layer_raw = short(record, 2);
         (
-            short(record, 2),
+            layer_raw & 0x01ff,
+            (layer_raw >> 9) as u8,
             u16::from(record[4]),
             record[5],
             record[6],
@@ -124,8 +210,8 @@ fn attributes(record: &[u8], layout: Layout) -> BestEffortAttributes {
     BestEffortAttributes {
         tag_raw,
         flags_raw,
-        layer: layer_raw & 0x01ff,
-        segment: (layer_raw >> 9) as u8,
+        layer,
+        segment,
         color,
         line_type: dependent(line_type, 33, 34),
         width: dependent(width, 17, 18),
@@ -166,6 +252,7 @@ struct Reader<'a> {
     layout: Layout,
     limits: &'a BestEffortLimits,
     report: BestEffortReport,
+    properties: Vec<BestEffortProperty>,
     entities: u64,
     curve_points: u64,
 }
@@ -191,6 +278,59 @@ impl Reader<'_> {
         }
     }
 
+    /// Keep a property record: an owner in the primary record, then a name
+    /// and a value as two terminated strings in the continuation records.
+    fn property(&mut self, node: &Node<'_>, table: BestEffortTable, base: u64) {
+        // Properties count against the entity limit without failing the read.
+        if self.properties.len() as u64 >= self.limits.max_entities {
+            return;
+        }
+        let Some(owner) = node.body().get(16..48) else {
+            return;
+        };
+        let (owner, mut lossy) = text::shift_jis(owner);
+        // As in `strings`, a record holds 48 bytes of text in both layouts.
+        let mut bytes = Vec::new();
+        for index in 0..node.continuations() {
+            if let Some(part) = node.part(index) {
+                bytes.extend_from_slice(&part[..part.len().min(48)]);
+            }
+        }
+        let unit = if self.layout.unicode { 2 } else { 1 };
+        let terminator = |from: usize| {
+            (from..bytes.len().saturating_sub(unit - 1))
+                .step_by(unit)
+                .find(|at| bytes[*at..*at + unit].iter().all(|byte| *byte == 0))
+                .unwrap_or(bytes.len() - bytes.len() % unit)
+        };
+        let name_end = terminator(0);
+        let value_start = (name_end + unit).min(bytes.len());
+        let value_end = terminator(value_start).max(value_start);
+        let mut decode = |range: std::ops::Range<usize>| {
+            let (string, bad) = if self.layout.unicode {
+                text::utf16(&bytes[range])
+            } else {
+                text::shift_jis(&bytes[range])
+            };
+            lossy |= bad;
+            text::unescape(&string)
+        };
+        let name = decode(0..name_end);
+        let value = decode(value_start..value_end);
+        self.properties.push(BestEffortProperty {
+            source: BestEffortSource {
+                table,
+                record_index: node.index,
+                payload_offset: base + node.index * self.layout.record as u64,
+                record_count: node.record_count,
+            },
+            owner,
+            name,
+            value,
+            lossy,
+        });
+    }
+
     fn string(&self, bytes: &[u8]) -> String {
         if self.layout.unicode {
             text::utf16(bytes).0
@@ -200,11 +340,15 @@ impl Reader<'_> {
     }
 
     /// NUL-separated strings of a part and the continuations written after it.
+    ///
+    /// Every record holds 48 bytes of them in both layouts: the wider records
+    /// of the Unicode layout leave their last 16 bytes unused here.
     fn strings(&self, node: &Node<'_>) -> Vec<String> {
-        let mut bytes = node.plain().to_vec();
+        let own = node.plain();
+        let mut bytes = own[..own.len().min(48)].to_vec();
         for index in 0..node.continuations() {
             if let Some(part) = node.part(index) {
-                bytes.extend_from_slice(part);
+                bytes.extend_from_slice(&part[..part.len().min(48)]);
             }
         }
         let unit = if self.layout.unicode { 2 } else { 1 };
@@ -254,16 +398,32 @@ impl Reader<'_> {
             TEXT | NUMERIC_TEXT => self.text(node),
             BLOCK_REFERENCE => self.insert(node),
             ARROWHEAD => arrowhead(node),
-            IMAGE => self.placed_file(node, true),
-            OVERLAY => self.placed_file(node, false),
+            IMAGE => self.placed_file(node, Placed::Image),
+            OVERLAY => self.placed_file(node, Placed::Overlay),
+            SYMBOL => self.placed_file(node, Placed::Symbol),
+            POLYGON_3D => {
+                let hole_count = short(node.body(), 0);
+                let children = self.entities(&node.children, table, base)?;
+                Ok((BestEffortGeometry::Polygon3D { hole_count }, children))
+            }
+            CAMERA | LIGHT => sight(node),
+            LAYOUT => self.layout(node),
+            VIEWPORT => viewport(node),
             POLYLINE | POLYLINE_3D => self.polyline(node, table, base)?,
             EXTENDED_POLYGON => self.extended_polygon(node, table, base)?,
             HATCH => self.hatch(node, table),
             DIMENSION => self.dimension(node, table, base)?,
             LEADER => self.leader(node, table, base)?,
             PACKAGE => self.package(node, table, base)?,
-            PROPERTY => {
+            PROPERTY | EARLY_PROPERTY => {
                 self.report.property_records += 1;
+                self.property(node, table, base);
+                return Ok(None);
+            }
+            // The application clears the tag of an object it erases and
+            // leaves the records in place.
+            ERASED => {
+                self.report.erased_objects += 1;
                 return Ok(None);
             }
             kind => {
@@ -313,6 +473,7 @@ impl Reader<'_> {
         const NUMBER: &str = "text has a non-finite field";
         let body = node.body();
         let layout = node.part(0).ok_or(SHORT)?;
+        let layout_header = node.continuation(0).ok_or(SHORT)?;
         let font = node.part(1).ok_or(SHORT)?;
         let font_header = node.continuation(1).ok_or(SHORT)?;
         let number_record = node.continuation(2).ok_or(SHORT)?;
@@ -323,7 +484,8 @@ impl Reader<'_> {
             let Some(part) = node.part(index) else {
                 break;
             };
-            for unit_bytes in part.chunks_exact(unit) {
+            // A record holds 48 bytes of the string in both layouts.
+            for unit_bytes in part[..part.len().min(48)].chunks_exact(unit) {
                 if text_bytes.len() == length || unit_bytes.iter().all(|byte| *byte == 0) {
                     break 'body;
                 }
@@ -348,6 +510,7 @@ impl Reader<'_> {
                 width: number(body, 24).ok_or(NUMBER)?,
                 height: number(body, 32).ok_or(NUMBER)?,
                 spacing: number(body, 40).ok_or(NUMBER)?,
+                output_size: layout_header[12] != 0,
                 rotation_degrees: number(font, 0).ok_or(NUMBER)?,
                 slant_degrees: number(font, 8).ok_or(NUMBER)?,
                 origin: short(layout, 2),
@@ -411,7 +574,38 @@ impl Reader<'_> {
     }
 
     /// An image or an external drawing: a placement and the names of a file.
-    fn placed_file(&mut self, node: &Node<'_>, image: bool) -> Decoded {
+    fn layout(&mut self, node: &Node<'_>) -> Decoded {
+        let body = node.body();
+        let single = |at: usize| {
+            f64::from(f32::from_le_bytes([
+                body[at],
+                body[at + 1],
+                body[at + 2],
+                body[at + 3],
+            ]))
+        };
+        let paper_size = [single(8), single(12)];
+        if !paper_size.iter().all(|side| side.is_finite()) {
+            return Err("layout has a non-finite paper size");
+        }
+        let name = node
+            .children
+            .iter()
+            .find(|child| child.tag as u8 == LAYOUT_NAME)
+            .and_then(|child| self.strings(child).into_iter().next())
+            .unwrap_or_default();
+        Ok((
+            BestEffortGeometry::Layout {
+                number: short(body, 0),
+                name,
+                paper_type: short(body, 2),
+                paper_size,
+            },
+            Vec::new(),
+        ))
+    }
+
+    fn placed_file(&mut self, node: &Node<'_>, placed: Placed) -> Decoded {
         const SHORT: &str = "placed file has fewer continuation records than its layout";
         const NUMBER: &str = "placed file has a non-finite field";
         let placement = node.part(0).ok_or(SHORT)?;
@@ -428,7 +622,7 @@ impl Reader<'_> {
         let position = point(placement, 0).ok_or(NUMBER)?;
         let elevation = number(placement, 16).ok_or(NUMBER)?;
         let scale = point(placement, 24).ok_or(NUMBER)?;
-        let geometry = if image {
+        let geometry = if placed == Placed::Image {
             BestEffortGeometry::Image {
                 file_name,
                 directory,
@@ -440,6 +634,7 @@ impl Reader<'_> {
             }
         } else {
             BestEffortGeometry::ExternalReference {
+                symbol: placed == Placed::Symbol,
                 file_name,
                 directory,
                 relative_directory: names.next().unwrap_or_default(),
@@ -524,7 +719,21 @@ impl Reader<'_> {
         base: u64,
     ) -> Result<Decoded> {
         let body = node.body();
-        let children = self.entities(&node.children, table, base)?;
+        let mut name = String::new();
+        let mut children = Vec::with_capacity(node.children.len());
+        for child in &node.children {
+            match child.tag as u8 {
+                AREA_NAME => {
+                    name = self.strings(child).into_iter().next().unwrap_or_default();
+                }
+                AREA_IDENTITY | AREA_ORIGIN | AREA_SCALE => {}
+                _ => {
+                    if let Some(entity) = self.entity(child, table, base)? {
+                        children.push(entity);
+                    }
+                }
+            }
+        }
         let flags_raw = body[1];
         Ok(Ok((
             BestEffortGeometry::ExtendedPolygon {
@@ -534,6 +743,7 @@ impl Reader<'_> {
                 reference_number: u32::from(short(body, 4)),
                 hole_count: short(body, 14),
                 link_id: u32::from(short(body, 12)),
+                name,
             },
             children,
         )))
@@ -544,11 +754,24 @@ impl Reader<'_> {
         let body = node.body();
         let mut lines = Vec::new();
         let mut pattern = None;
+        let mut gradation = None;
         let mut unknown_parts = 0u64;
         for child in &node.children {
             let part = child.body();
             let style = attributes(child.record(), self.layout);
             match child.tag as u8 {
+                HATCH_GRADATION => {
+                    // A plain part: its values follow a 16-byte header.
+                    let part = child.plain();
+                    gradation = Some(BestEffortGradation {
+                        start: point(part, 0).ok_or(NUMBER)?,
+                        end: point(part, 16).ok_or(NUMBER)?,
+                        // Two colors of four bytes each, then the type.
+                        rgb_start: [part[32], part[33], part[34]],
+                        rgb_end: [part[36], part[37], part[38]],
+                        gradation_type: part[40],
+                    });
+                }
                 HATCH_LINE => lines.push(BestEffortHatchLine {
                     origin: point(part, 0).ok_or(NUMBER)?,
                     pitch: number(part, 16).ok_or(NUMBER)?,
@@ -602,6 +825,7 @@ impl Reader<'_> {
                 link_id: u32::from(short(body, 2)),
                 lines,
                 pattern,
+                gradation,
             },
             Vec::new(),
         ))
@@ -911,9 +1135,11 @@ fn tables(bytes: &[u8], header: &Header, tail: Option<u64>) -> Option<Tables> {
     let specs = header.tables.as_ref()?;
     let unicode = header.layout.unicode;
     let (name_at, name_size) = specs.layer_name;
+    let early = specs.early;
     let layer = |index: u16, row: &[u8]| {
         let field = &row[name_at..name_at + name_size];
-        let flags_raw = short(row, 0);
+        // The first releases left the low byte unset.
+        let flags_raw = short(row, 0) & if early { 0xff00 } else { 0xffff };
         BestEffortLayer {
             index,
             name: if unicode {
@@ -925,7 +1151,7 @@ fn tables(bytes: &[u8], header: &Header, tail: Option<u64>) -> Option<Tables> {
             hidden: flags_raw & 0x0100 != 0,
             color: short(row, 4),
             line_type: short(row, 6),
-            width: short(row, 8),
+            width: if early { 0 } else { short(row, 8) },
         }
     };
     let color = |index: u16, row: &[u8]| BestEffortColor {
@@ -935,7 +1161,7 @@ fn tables(bytes: &[u8], header: &Header, tail: Option<u64>) -> Option<Tables> {
     };
     // The older layout keeps color 256 and the layers 0 and 256 in its tail.
     let extension = |offset: u64| {
-        tail.and_then(|tail| {
+        tail.filter(|_| !early).and_then(|tail| {
             let start = usize::try_from(tail + offset).ok()?;
             bytes.get(start..start + 64)
         })
@@ -965,7 +1191,10 @@ fn tables(bytes: &[u8], header: &Header, tail: Option<u64>) -> Option<Tables> {
         .filter(|(index, _)| (1..=32).contains(index))
         .map(|(index, row)| {
             let mut pattern: Vec<f64> = (0..30)
-                .map(|slot| f64::from(short(row, 4 + slot * 2)) / 100.0)
+                .map(|slot| short(row, 4 + slot * 2))
+                // A zero ends the list; the first releases left the rest unset.
+                .take_while(|length| !early || *length != 0)
+                .map(|length| f64::from(length) / 100.0)
                 .collect();
             while pattern.last() == Some(&0.0) {
                 pattern.pop();
@@ -992,20 +1221,47 @@ fn tables(bytes: &[u8], header: &Header, tail: Option<u64>) -> Option<Tables> {
     })
 }
 
-fn settings(bytes: &[u8], layout: Layout) -> Option<BestEffortSettings> {
-    // The Unicode layout has the same fields 64 bytes further on.
-    let bytes = bytes.get(if layout.unicode { 0x40 } else { 0 }..)?;
+fn settings(header: &[u8], layout: Layout) -> Option<BestEffortSettings> {
+    // The Unicode layout has the same fields 64 bytes further on: its first
+    // comment field is twice as long.
+    let bytes = header.get(if layout.unicode { 0x40 } else { 0 }..)?;
     let factor = number(bytes, 0x178)?;
     if factor <= 0.0 {
         return None;
     }
     let drawing_scale = 1.0 / factor;
+    let scale_ratio = number(bytes, 0x278)
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+        .unwrap_or(1.0);
     drawing_scale.is_finite().then_some(BestEffortSettings {
         drawing_origin: point(bytes, 0x140)?,
         drawing_scale,
         paper_size: point(bytes, 0x188)?,
         paper_origin: point(bytes, 0x198)?,
+        paper_type: long(bytes.get(..0x188)?, 0x180),
+        paper_portrait: long(bytes, 0x184) != 0,
+        scale_ratio,
+        comment: comment(header, bytes, layout),
+        width_by_color: bytes.len() >= 0x204 && long(bytes, 0x200) == 1,
     })
+}
+
+/// The drawing comment. Two fields hold it: a long one, which the current
+/// application reads, and the short one of the first releases before it.
+fn comment(header: &[u8], shifted: &[u8], layout: Layout) -> String {
+    let field = |bytes: &[u8], at: usize, size: usize| {
+        let field = bytes.get(at..at + size)?;
+        let (text, lossy) = if layout.unicode {
+            text::utf16(field)
+        } else {
+            text::shift_jis(field)
+        };
+        (!lossy && !text.is_empty() && !text.chars().any(char::is_control)).then_some(text)
+    };
+    let unit = if layout.unicode { 2 } else { 1 };
+    field(shifted, 0x350, 256 * unit)
+        .or_else(|| field(header, 0x90, 64 * unit))
+        .unwrap_or_default()
 }
 
 fn table_records(bytes: &[u8], start: u64, count: u64, record: usize) -> Result<&[u8]> {
@@ -1038,13 +1294,15 @@ pub(crate) fn drawing(
     if terminal[0] != 0xff {
         return Err(invalid("record table has no terminal record"));
     }
-    // Generations 3 to 25 are the ones the application can save.
-    let marker_observed = (3..=25).contains(&header.marker_raw);
+    // Generations 3 to 25 are the ones the application can save; generation 1
+    // is what the oldest part libraries hold.
+    let marker_observed = header.marker_raw == 1 || (3..=25).contains(&header.marker_raw);
     let mut reader = Reader {
         marker_raw: header.marker_raw,
         layout,
         limits,
         report: BestEffortReport::default(),
+        properties: Vec::new(),
         entities: 0,
         curve_points: 0,
     };
@@ -1139,6 +1397,7 @@ pub(crate) fn drawing(
         widths: tables.widths,
         blocks,
         entities,
+        properties: reader.properties,
         report: reader.report,
     })
 }

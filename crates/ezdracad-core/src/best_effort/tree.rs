@@ -3,6 +3,14 @@
 use crate::{DracadError, Result};
 
 pub(crate) const CONTINUATION: u16 = 0x00fe;
+
+/// Whether a record continues the object before it.
+///
+/// Only the first byte counts. The rest of a continuation header is unused,
+/// and saved drawings exist where it holds leftover bytes instead of zeros.
+const fn is_continuation(tag: u16) -> bool {
+    tag & 0x00ff == CONTINUATION
+}
 const TERMINAL: u16 = 0x00ff;
 
 /// Record layout of a payload.
@@ -37,11 +45,17 @@ impl Layout {
 
     /// Declared number of records of the object that starts with `record`.
     fn span(self, record: &[u8]) -> usize {
-        if self.unicode {
-            u32::from_le_bytes([record[12], record[13], record[14], record[15]]) as usize
-        } else {
-            usize::from(u16::from_le_bytes([record[8], record[9]]))
+        if !self.unicode {
+            return usize::from(u16::from_le_bytes([record[8], record[9]]));
         }
+        // Plain parts keep the 16-byte header of the older layout, where the
+        // bytes of the length field mean something else; they own no members.
+        // The two hatch parts with attributes have the header of an object.
+        let kind = record[0];
+        if kind >= 0x40 && !matches!(kind, 0x4b | 0x4c) {
+            return 1;
+        }
+        u32::from_le_bytes([record[12], record[13], record[14], record[15]]) as usize
     }
 }
 
@@ -125,7 +139,7 @@ pub(crate) fn parse<'a>(
     let mut index = start;
     while index < end {
         let tag = tag_at(index);
-        if tag == CONTINUATION || tag & 0x00ff == TERMINAL {
+        if is_continuation(tag) || tag & 0x00ff == TERMINAL {
             issues.orphan_records += 1;
             index += 1;
             continue;
@@ -139,12 +153,12 @@ pub(crate) fn parse<'a>(
         }
         if declared <= 1 {
             // A single-record object keeps the continuations written after it.
-            while stop < end && tag_at(stop) == CONTINUATION {
+            while stop < end && is_continuation(tag_at(stop)) {
                 stop += 1;
             }
         }
         let mut own = 1;
-        while index + own < stop && tag_at(index + own) == CONTINUATION {
+        while index + own < stop && is_continuation(tag_at(index + own)) {
             own += 1;
         }
         let children = if index + own < stop {

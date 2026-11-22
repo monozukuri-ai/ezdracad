@@ -62,12 +62,15 @@ impl Shape {
     }
 
     /// Set the layer, color, line type and width fields of an object record.
+    /// `layer` carries the sheet number above its nine bits, as the older
+    /// layout saves it; the Unicode layout has a byte for the sheet.
     fn style(self, record: &mut Record, layer: u16, color: u8, line_type: u8, width: u8) {
         if self.wide {
+            record[3] = (layer >> 9) as u8;
             record[4..8].copy_from_slice(&u32::from(color).to_le_bytes());
             record[8] = line_type;
             record[9] = width;
-            record[10..12].copy_from_slice(&layer.to_le_bytes());
+            record[10..12].copy_from_slice(&(layer & 0x01ff).to_le_bytes());
         } else {
             record[2..4].copy_from_slice(&layer.to_le_bytes());
             record[4] = color;
@@ -122,7 +125,8 @@ impl Shape {
 
     fn text_bytes(self, tag: u16, body: &[u8], font: &[u8], origin: u16) -> Vec<Record> {
         let unit = if self.wide { 2 } else { 1 };
-        let capacity = self.size() - 16;
+        // A record holds 48 bytes of a string in both layouts.
+        let capacity = 48;
         let body_records = (body.len() + unit).div_ceil(capacity);
         let mut records = vec![self.object(
             tag,
@@ -132,7 +136,10 @@ impl Shape {
         let mut layout = [0u8; 4];
         layout[..2].copy_from_slice(&((body.len() / unit) as u16).to_le_bytes());
         layout[2..].copy_from_slice(&origin.to_le_bytes());
-        records.push(self.continuation(&layout));
+        // A numeric text is sized on the output sheet: byte 12 of this record.
+        let mut sizing = [0u8; 11];
+        sizing[10] = u8::from(tag as u8 == 20);
+        records.push(self.plain(0xfe, &sizing, &layout));
         let mut style = floats(&[30.0, 5.0]);
         style.extend_from_slice(font);
         // Unit 19, item 1, flags 37, character set 128, family 49.
@@ -199,12 +206,13 @@ impl Shape {
             bytes.extend_from_slice(&self.encode(value));
             bytes.resize(bytes.len() + if self.wide { 2 } else { 1 }, 0);
         }
-        let capacity = self.size() - 16;
-        bytes.resize(2 * capacity, 0);
-        vec![
-            self.plain(0x4a, &[], &bytes[..capacity]),
-            self.continuation(&bytes[capacity..]),
-        ]
+        let capacity = 48;
+        bytes.resize(bytes.len().div_ceil(capacity).max(2) * capacity, 0);
+        let mut records = vec![self.plain(0x4a, &[], &bytes[..capacity])];
+        for chunk in bytes[capacity..].chunks(capacity) {
+            records.push(self.continuation(chunk));
+        }
+        records
     }
 }
 
@@ -622,6 +630,7 @@ fn every_decoded_kind_keeps_its_stored_values() {
         (37, 128, 49, 19, 1)
     );
     assert!(!text.numeric && text.number.is_none() && !text.lossy && !text.format_codes);
+    assert!(!text.output_size);
     assert_eq!(
         entities[7].geometry,
         BestEffortGeometry::Polyline {
@@ -657,7 +666,8 @@ fn every_decoded_kind_keeps_its_stored_values() {
             }),
             reference_number: 1,
             hole_count: 2,
-            link_id: 0x098d
+            link_id: 0x098d,
+            name: String::new(),
         }
     );
     assert_eq!(entities[9].children[0].children.len(), 4);
@@ -674,7 +684,8 @@ fn every_decoded_kind_keeps_its_stored_values() {
                 line_type: 2,
                 width: 4
             }],
-            pattern: None
+            pattern: None,
+            gradation: None,
         }
     );
     assert_eq!(
@@ -699,7 +710,7 @@ fn every_decoded_kind_keeps_its_stored_values() {
     );
     assert_eq!(entities[11].attributes.link_id, 104);
     let number = text_of(&entities[11].children[0]);
-    assert!(number.numeric);
+    assert!(number.numeric && number.output_size);
     assert_eq!((number.text.as_str(), number.number), ("58", Some(1234.5)));
     assert_eq!(entities[11].children[0].attributes.link_id, 104);
     assert_eq!(
@@ -761,6 +772,7 @@ fn every_decoded_kind_keeps_its_stored_values() {
     assert_eq!(
         entities[16].geometry,
         BestEffortGeometry::ExternalReference {
+            symbol: false,
             file_name: "frame.mps".into(),
             directory: "D:\\Work\\".into(),
             relative_directory: ".\\".into(),
@@ -856,7 +868,12 @@ fn unicode_tables_settings_and_blocks_are_read() {
             drawing_origin: [5.0, -6.0],
             drawing_scale: 50.0,
             paper_size: [420.0, 297.0],
-            paper_origin: [-100.0, 14850.0]
+            paper_origin: [-100.0, 14850.0],
+            paper_type: 0,
+            paper_portrait: false,
+            scale_ratio: 1.0,
+            comment: String::new(),
+            width_by_color: false,
         })
     );
 }
@@ -896,7 +913,7 @@ fn dependent_attributes_and_layout_membership_are_distinguished() {
             ]
         );
         let last = &drawing.entities[4].attributes;
-        assert!(last.hidden() && last.polyline_member() && !last.reversed_member());
+        assert!(last.polyline_member() && !last.reversed_member());
         assert_eq!((last.tag_raw, last.flags_raw), (0x0a02, 0x0a));
         // The direction flag only counts on a member of a polyline.
         let flags = |flags_raw| BestEffortAttributes { flags_raw, ..*last };
@@ -1109,7 +1126,7 @@ fn named_hatch_patterns_keep_their_name_and_numbers() {
                     shape.attributed_part(0x4c, 3, &[3.0, 4.0, 0.38, 360.0, 1.0, 90.0]),
                     shape.plain(0x4d, &[], &floats(&[0.005, 0.005, 360.0])),
                     shape.plain(0x4e, &[], &name),
-                    shape.plain(0x4f, &[], &[]),
+                    shape.plain(0x5f, &[], &[]),
                 ]],
             )],
         );
@@ -1126,7 +1143,8 @@ fn named_hatch_patterns_keep_their_name_and_numbers() {
                     color: 7,
                     line_type: 2,
                     width: 4
-                })
+                }),
+                gradation: None,
             }
         );
         assert_eq!(codes(&drawing), ["hatch_parts_ignored"]);
@@ -1216,7 +1234,12 @@ fn tables_and_settings_are_reported_without_being_applied() {
             drawing_origin: [5.0, -6.0],
             drawing_scale: 50.0,
             paper_size: [420.0, 297.0],
-            paper_origin: [-100.0, 14850.0]
+            paper_origin: [-100.0, 14850.0],
+            paper_type: 0,
+            paper_portrait: false,
+            scale_ratio: 1.0,
+            comment: String::new(),
+            width_by_color: false,
         })
     );
     // Settings do not move the stored coordinates.
@@ -1244,8 +1267,8 @@ fn unknown_and_misfit_objects_are_counted_and_do_not_hide_later_ones() {
         5,
         vec![
             property,
-            vec![NARROW.object(0x16, 1, &[])],
-            NARROW.group(0x1d, &[], vec![NARROW.line(2, [0.0, 0.0], [1.0, 1.0])]),
+            vec![NARROW.object(0x2e, 1, &[])],
+            NARROW.group(0x2f, &[], vec![NARROW.line(2, [0.0, 0.0], [1.0, 1.0])]),
             broken_line,
             lone_circle,
             NARROW.curve(4, &[0.0, 0.0], &[-1.0, 0.0, 90.0]),
@@ -1269,7 +1292,7 @@ fn unknown_and_misfit_objects_are_counted_and_do_not_hide_later_ones() {
     assert_eq!(report.property_records, 1);
     assert_eq!(
         report.unsupported_counts.iter().collect::<Vec<_>>(),
-        [(&0x16, &1), (&0x1d, &1)]
+        [(&0x2e, &1), (&0x2f, &1)]
     );
     assert_eq!(
         report.failed_counts.iter().collect::<Vec<_>>(),
@@ -1687,4 +1710,494 @@ fn compressed_envelopes_of_both_layouts_are_read() {
             ..
         })
     ));
+}
+
+/// Records of a string object: a head with `owner` in its body, then the
+/// strings in continuation records of 48 bytes each.
+fn string_records(shape: Shape, tag: u16, owner: &str, strings: &[u8]) -> Vec<Record> {
+    let mut body = vec![0u8; 16];
+    body.extend_from_slice(owner.as_bytes());
+    let chunks: Vec<&[u8]> = strings.chunks(48).collect();
+    let mut records = vec![shape.object(tag, 1 + chunks.len() as u16, &body)];
+    records.extend(chunks.into_iter().map(|chunk| shape.continuation(chunk)));
+    records
+}
+
+fn terminated(shape: Shape, values: &[&str]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for value in values {
+        bytes.extend_from_slice(&shape.encode(value));
+        bytes.resize(bytes.len() + if shape.wide { 2 } else { 1 }, 0);
+    }
+    bytes
+}
+
+#[test]
+fn properties_keep_their_owner_name_and_value() {
+    for shape in [NARROW, WIDE] {
+        // The value runs over three records; the older layout escapes U+9AD9.
+        let long = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789ABCDEFGHIJ";
+        let strings = if shape.wide {
+            terminated(shape, &["Owner \u{9ad9}", long])
+        } else {
+            let mut bytes = b"Owner {\\uni\"9ad9\"}\0".to_vec();
+            bytes.extend_from_slice(long.as_bytes());
+            bytes.push(0);
+            bytes
+        };
+        let drawing = read(
+            shape,
+            25,
+            vec![
+                string_records(shape, 0x33, "DRACAD_SYSTEM_DRAWING_PSET", &strings),
+                // A property without a value, in the kind of the first releases.
+                string_records(
+                    shape,
+                    0x3f,
+                    "DRACAD_SYSTEM",
+                    &terminated(shape, &["PSET_LIST"]),
+                ),
+                // An erased object keeps its records and loses its tag.
+                shape.line(0, [1.0, 1.0], [2.0, 2.0]),
+                shape.line(2, [0.0, 0.0], [1.0, 1.0]),
+            ],
+        );
+        assert_eq!(kinds(&drawing.entities), ["LINE"]);
+        assert!(!drawing.report.lossy(), "{:?}", drawing.report);
+        assert_eq!(drawing.report.property_records, 2);
+        assert_eq!(drawing.report.erased_objects, 1);
+        let values: Vec<_> = drawing
+            .properties
+            .iter()
+            .map(|property| {
+                (
+                    property.owner.as_str(),
+                    property.name.as_str(),
+                    property.value.as_str(),
+                    property.lossy,
+                    property.source.record_index,
+                )
+            })
+            .collect();
+        assert_eq!(
+            values,
+            [
+                (
+                    "DRACAD_SYSTEM_DRAWING_PSET",
+                    "Owner \u{9ad9}",
+                    long,
+                    false,
+                    0
+                ),
+                ("DRACAD_SYSTEM", "PSET_LIST", "", false, values[1].4),
+            ]
+        );
+        assert_eq!(
+            drawing.properties[0].source.record_count,
+            1 + strings.len().div_ceil(48) as u64
+        );
+    }
+}
+
+#[test]
+fn settings_carry_the_paper_the_stated_scale_and_the_comment() {
+    for shape in [NARROW, WIDE] {
+        let shift = if shape.wide { 0x40 } else { 0 };
+        let mut bytes = build(&Parts {
+            marker: 25,
+            wide: shape.wide,
+            ..Parts::default()
+        });
+        bytes[0x180 + shift] = 4;
+        bytes[0x184 + shift] = 1;
+        bytes[0x200 + shift] = 1;
+        put(&mut bytes, 0x278 + shift, &[0.01]);
+        let long = shape.encode("Site A");
+        bytes[0x350 + shift..0x350 + shift + long.len()].copy_from_slice(&long);
+        let short = shape.encode("old");
+        bytes[0x90..0x90 + short.len()].copy_from_slice(&short);
+        let settings = read_bytes(&bytes).unwrap().settings.unwrap();
+        assert_eq!(settings.paper_type, 4);
+        assert!(settings.paper_portrait);
+        assert!(settings.width_by_color);
+        assert_eq!(settings.scale_ratio, 0.01);
+        assert_eq!(settings.stated_scale(), 5000.0);
+        assert_eq!(settings.comment, "Site A");
+        // Without the long field the short one of the first releases counts.
+        bytes[0x350 + shift..0x350 + shift + long.len()].fill(0);
+        let settings = read_bytes(&bytes).unwrap().settings.unwrap();
+        assert_eq!(settings.comment, "old");
+        // A ratio that is no positive number is read as none.
+        put(&mut bytes, 0x278 + shift, &[-1.0]);
+        assert_eq!(
+            read_bytes(&bytes).unwrap().settings.unwrap().scale_ratio,
+            1.0
+        );
+    }
+}
+
+#[test]
+fn leftover_bytes_in_unused_places_do_not_hide_objects() {
+    // A continuation header beyond its first byte is unused.
+    let mut arc = NARROW.curve(4, &[8.0, 9.0], &[2.0, 30.0, 120.0]);
+    arc[1][1..16].copy_from_slice(&[
+        0xff, 0xff, 0xff, 0xa0, 0x88, 0xe7, 0, 0x40, 0x74, 0, 0, 0x1c, 0xa5, 0xb8, 0,
+    ]);
+    let mut payload = build(&Parts {
+        marker: 17,
+        records: arc,
+        ..Parts::default()
+    });
+    // So are the bytes after the terminator of the identifier.
+    payload[19..32].fill(0xfe);
+    let drawing = read_bytes(&payload).unwrap();
+    assert_eq!(kinds(&drawing.entities), ["ARC"]);
+    assert!(!drawing.report.lossy());
+    // The other entry points keep to the zeroed field.
+    let file = compound(crate::DRACAD_CLSID, "/Contents", &payload);
+    assert!(crate::inspect(&file, &ParseLimits::default()).is_err());
+    assert_eq!(read_bytes(&file).unwrap().entities.len(), 1);
+    // The identifier itself must end where it ends.
+    payload[18] = b'!';
+    assert!(read_bytes(&payload).is_err());
+}
+
+#[test]
+fn compound_files_without_a_class_identifier_are_read() {
+    const NONE: &str = "00000000-0000-0000-0000-000000000000";
+    let payload = build(&Parts {
+        marker: 3,
+        records: NARROW.line(2, [0.0, 0.0], [1.0, 1.0]),
+        ..Parts::default()
+    });
+    let plain = compound(NONE, "/Contents", &payload);
+    let drawing = read_bytes(&plain).unwrap();
+    assert_eq!(
+        (drawing.format, drawing.entities.len()),
+        (DracadFormat::Mpz, 1)
+    );
+    let secure = compound(NONE, "/SecureContents", &envelope(0, &payload));
+    assert_eq!(read_bytes(&secure).unwrap().format, DracadFormat::Mps);
+    // A further switch of the envelope is set in some drawings.
+    let mut switched = envelope(0, &payload);
+    switched[16] = 1;
+    let switched = compound(NONE, "/SecureContents", &switched);
+    assert_eq!(read_bytes(&switched).unwrap().entities.len(), 1);
+    // A switch that forbids printing stays unread, like a password.
+    let mut locked = envelope(0, &payload);
+    locked[10] = 1;
+    let locked = compound(crate::DRACAD_CLSID, "/SecureContents", &locked);
+    assert!(matches!(
+        read_bytes(&locked),
+        Err(DracadError::UnsupportedFormat(_))
+    ));
+    // Another program's stream of the same name is no drawing.
+    let foreign = compound(NONE, "/Contents", &vec![7u8; 9000]);
+    assert!(matches!(
+        read_bytes(&foreign),
+        Err(DracadError::UnsupportedFormat(_))
+    ));
+    // The other entry points still ask for the class identifier.
+    let info = crate::inspect(&plain, &ParseLimits::default()).unwrap();
+    assert_eq!(info.format, DracadFormat::UnknownCfb);
+}
+
+/// A payload with the style tables of the first releases: 200 layers, 32
+/// colors, 16 line types and 16 widths, unused bytes left as they were.
+fn build_early(marker: u16, records: Vec<Record>) -> Vec<u8> {
+    let mut terminal = vec![0u8; 64];
+    terminal[0] = 0xff;
+    let mut bytes = vec![0u8; 8192];
+    bytes[..18].copy_from_slice(b"DRACAD for Windows");
+    bytes[0x22..0x24].copy_from_slice(&marker.to_le_bytes());
+    put(&mut bytes, 0x178, &[0.02]);
+    put(&mut bytes, 0x188, &[594.0, 420.0, 0.0, 21000.0]);
+    let count = records.len() as u32;
+    for record in records.iter().chain([&terminal]) {
+        bytes.extend_from_slice(record);
+    }
+    let mut sections = vec![bytes.len() as u32];
+    let mut layers = vec![0xcdu8; 200 * 64];
+    for row in layers.chunks_exact_mut(64) {
+        row[1] = 0;
+        row[2..8].copy_from_slice(&[0, 0, 1, 0, 1, 0]);
+        row[32] = 0;
+    }
+    layers[64 + 1] = 0x04;
+    let mut colors = vec![0xcdu8; 32 * 64];
+    colors[2..8].copy_from_slice(&[10, 0, 0, 0, 255, 2]);
+    let mut line_types = vec![0xcdu8; 16 * 64];
+    line_types[2..6].copy_from_slice(&[0, 0, 0, 0]);
+    line_types[64 + 2..64 + 12].copy_from_slice(&[1, 0, 100, 0, 200, 0, 100, 0, 0, 0]);
+    let mut widths = vec![0xcdu8; 16 * 64];
+    widths[2..4].copy_from_slice(&[1, 0]);
+    widths[64 + 2..64 + 4].copy_from_slice(&[5, 0]);
+    for table in [
+        layers,
+        colors,
+        line_types,
+        widths,
+        vec![0; 5888],
+        vec![0; 4096],
+    ] {
+        bytes.extend_from_slice(&table);
+        sections.push(bytes.len() as u32);
+    }
+    bytes.resize(bytes.len() + 9472, 0);
+    let end = bytes.len() as u32;
+    bytes[0x24..0x28].copy_from_slice(&8192u32.to_le_bytes());
+    for (index, value) in sections.iter().enumerate() {
+        bytes[0x28 + index * 4..0x2c + index * 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[0x50..0x54].copy_from_slice(&end.to_le_bytes());
+    bytes[0x58..0x5c].copy_from_slice(&count.to_le_bytes());
+    bytes.extend_from_slice(&[0; 4]);
+    bytes
+}
+
+#[test]
+fn the_tables_of_the_first_releases_are_read() {
+    let drawing = read_bytes(&build_early(1, NARROW.line(2, [0.0, 0.0], [1.0, 1.0]))).unwrap();
+    assert!(drawing.marker_observed);
+    assert!(codes(&drawing).is_empty(), "{:?}", drawing.report);
+    assert_eq!(
+        (
+            drawing.layers.len(),
+            drawing.colors.len(),
+            drawing.line_types.len(),
+            drawing.widths.len()
+        ),
+        (200, 32, 16, 16)
+    );
+    // Leftover bytes are no flags, widths or names.
+    let layer = &drawing.layers[1];
+    assert_eq!(
+        (layer.index, layer.flags_raw, layer.hidden),
+        (2, 0x0400, false)
+    );
+    assert_eq!((layer.color, layer.line_type, layer.width), (1, 1, 0));
+    assert_eq!(layer.name, "");
+    assert_eq!(drawing.colors[0].rgb, [0, 0, 255]);
+    assert_eq!(drawing.colors[0].pen_width, 0.1);
+    // A zero ends a line pattern; what follows was never set.
+    assert!(drawing.line_types[0].pattern.is_empty());
+    assert_eq!(drawing.line_types[1].pattern, [1.0, 2.0, 1.0]);
+    assert_eq!(drawing.widths[1].width, 0.05);
+    assert_eq!(drawing.entities.len(), 1);
+}
+
+#[test]
+fn named_areas_gradations_and_their_parts_are_read() {
+    for shape in [NARROW, WIDE] {
+        let ring = |points: &[[f64; 2]]| -> Vec<Vec<Record>> {
+            points
+                .windows(2)
+                .map(|pair| shape.line(0x0802, pair[0], pair[1]))
+                .collect()
+        };
+        let square = [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 0.0]];
+        // The name part saves a length where an object saves its span.
+        let name = shape.encode("Room");
+        let mut length = [0u8; 14];
+        length[12..14].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        let mut region = [0u8; 16];
+        region[0] = 1;
+        region[1] = 4;
+        region[2] = 4;
+        region[6] = 204;
+        let mut gradation = floats(&[1.0, 2.0, 3.0, 4.0]);
+        gradation.extend_from_slice(&[18, 204, 237, 0, 255, 255, 255, 0, 2]);
+        let mut hatch = [2u8, 0, 0, 0];
+        hatch[2..4].copy_from_slice(&7u16.to_le_bytes());
+        let drawing = read(
+            shape,
+            25,
+            vec![
+                shape.group(
+                    12,
+                    &region,
+                    vec![
+                        shape.group(10, &[0, 1, 0, 0], ring(&square)),
+                        vec![shape.plain(0x56, &[], &[1, 2, 3, 4])],
+                        shape.part(0x57, &[0.0, 0.0, 0.0, 9.0, 8.0]),
+                        shape.part(0x5e, &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+                        vec![shape.plain(0x58, &length, &name)],
+                        shape.text(5, "Room", 5),
+                    ],
+                ),
+                shape.group(13, &hatch, vec![vec![shape.plain(0x4f, &[], &gradation)]]),
+            ],
+        );
+        assert!(!drawing.report.lossy(), "{:?}", drawing.report);
+        assert!(codes(&drawing).is_empty());
+        let area = &drawing.entities[0];
+        assert!(matches!(
+            &area.geometry,
+            BestEffortGeometry::ExtendedPolygon { name, fill: Some(fill), .. }
+                if name == "Room" && fill.transparency == 204
+        ));
+        assert_eq!(kinds(&area.children), ["POLYLINE", "TEXT"]);
+        assert_eq!(
+            drawing.entities[1].geometry,
+            BestEffortGeometry::Hatch {
+                hatch_type: 2,
+                link_id: 7,
+                lines: Vec::new(),
+                pattern: None,
+                gradation: Some(BestEffortGradation {
+                    start: [1.0, 2.0],
+                    end: [3.0, 4.0],
+                    rgb_start: [18, 204, 237],
+                    rgb_end: [255, 255, 255],
+                    gradation_type: 2,
+                }),
+            }
+        );
+    }
+}
+
+#[test]
+fn sheets_and_their_windows_are_read() {
+    for shape in [NARROW, WIDE] {
+        let on_sheet = |mut records: Vec<Record>| {
+            shape.style(&mut records[0], 1 << 9 | 3, 7, 2, 4);
+            records
+        };
+        let mut view = vec![0u8; 48];
+        view[1] = 0x80;
+        view[32..48].copy_from_slice(&floats(&[148.5, 105.0]));
+        let mut viewport = vec![shape.object(29, 4, &view)];
+        viewport.push(shape.continuation(&floats(&[-4484.0, 9311.0, 0.02, 0.02, 30.0])));
+        viewport.push(shape.continuation(&[]));
+        viewport.extend(shape.part(0x52, &[148.5, 105.0, 128.5, 85.0]));
+        let mut paper = vec![0u8; 16];
+        paper[..4].copy_from_slice(&[1, 0, 5, 0]);
+        paper[8..12].copy_from_slice(&297.0f32.to_le_bytes());
+        paper[12..16].copy_from_slice(&210.0f32.to_le_bytes());
+        let mut layout = vec![shape.object(30, 4, &paper)];
+        layout.push(shape.continuation(&[]));
+        layout.push(shape.continuation(&[]));
+        layout.push(shape.plain(0x51, &[], &shape.encode("Sheet")));
+        let drawing = read(
+            shape,
+            25,
+            vec![
+                shape.line(2, [0.0, 0.0], [1.0, 1.0]),
+                on_sheet(viewport),
+                on_sheet(shape.line(2, [10.0, 10.0], [100.0, 50.0])),
+                layout,
+            ],
+        );
+        assert!(!drawing.report.lossy(), "{:?}", drawing.report);
+        assert_eq!(
+            kinds(&drawing.entities),
+            ["LINE", "VIEWPORT", "LINE", "LAYOUT"]
+        );
+        let segments: Vec<u8> = drawing
+            .entities
+            .iter()
+            .map(|entity| entity.attributes.segment)
+            .collect();
+        assert_eq!(segments, [0, 1, 1, 0]);
+        assert_eq!(drawing.entities[2].attributes.layer, 3);
+        assert_eq!(
+            drawing.entities[1].geometry,
+            BestEffortGeometry::Viewport {
+                flags_raw: 0x80,
+                paper_point: [148.5, 105.0],
+                model_point: [-4484.0, 9311.0],
+                scale: [0.02, 0.02],
+                rotation_degrees: 30.0,
+                window: Some([[148.5, 105.0], [128.5, 85.0]]),
+            }
+        );
+        assert_eq!(
+            drawing.entities[3].geometry,
+            BestEffortGeometry::Layout {
+                number: 1,
+                name: "Sheet".into(),
+                paper_type: 5,
+                paper_size: [297.0, 210.0],
+            }
+        );
+    }
+}
+
+#[test]
+fn faces_symbols_cameras_and_lights_are_read() {
+    for shape in [NARROW, WIDE] {
+        let edge = |z: f64| vec![shape.object(0x0813, 1, &floats(&[0.0, 0.0, z, 1.0, 0.0, z]))];
+        let loop_of = |z: f64| shape.group(18, &[0, 1, 0, 0], vec![edge(z), edge(z)]);
+        let mut symbol = vec![shape.object(23, 0, &[])];
+        symbol.push(shape.continuation(&floats(&[10.0, 20.0, 275.0, 1.0, 1.0, 1.0])));
+        symbol.push(shape.continuation(&floats(&[0.0, 0.0, 270.0])));
+        symbol.push(shape.plain(0x49, &[], &[]));
+        // A directory longer than one record of names.
+        let directory = "C:\\Work\\Projects\\Building A\\Parts\\";
+        symbol.extend(shape.names(&["Chair.mps", directory]));
+        let span = symbol.len() as u16;
+        symbol[0] = shape.object(23, span, &[]);
+        let sight = |tag: u16| {
+            vec![
+                shape.object(tag, 3, &[]),
+                shape.continuation(&floats(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+                shape.continuation(&[]),
+            ]
+        };
+        let drawing = read(
+            shape,
+            22,
+            vec![
+                shape.group(22, &[1, 0], vec![loop_of(0.0), loop_of(5.0)]),
+                symbol,
+                sight(49),
+                sight(50),
+            ],
+        );
+        assert!(!drawing.report.lossy(), "{:?}", drawing.report);
+        assert_eq!(
+            kinds(&drawing.entities),
+            ["POLYGON_3D", "EXTERNAL_REFERENCE", "CAMERA", "LIGHT"]
+        );
+        assert_eq!(
+            drawing.entities[0].geometry,
+            BestEffortGeometry::Polygon3D { hole_count: 1 }
+        );
+        assert_eq!(kinds(&drawing.entities[0].children), ["POLYLINE"; 2]);
+        assert_eq!(
+            drawing.entities[1].geometry,
+            BestEffortGeometry::ExternalReference {
+                symbol: true,
+                file_name: "Chair.mps".into(),
+                directory: directory.into(),
+                relative_directory: String::new(),
+                position: [10.0, 20.0],
+                elevation: 275.0,
+                scale: [1.0, 1.0],
+                rotation_degrees: 270.0,
+            }
+        );
+        for (index, camera) in [(2, true), (3, false)] {
+            let expected = ([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]);
+            match &drawing.entities[index].geometry {
+                BestEffortGeometry::Camera { position, target } if camera => {
+                    assert_eq!((*position, *target), expected);
+                }
+                BestEffortGeometry::Light { position, target } if !camera => {
+                    assert_eq!((*position, *target), expected);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn long_strings_run_over_records_of_48_bytes_in_both_layouts() {
+    let value = "A drawing note of more than twenty-four characters, twice over";
+    for shape in [NARROW, WIDE] {
+        let drawing = read(shape, 25, vec![shape.text(5, value, 0)]);
+        assert!(!drawing.report.lossy(), "{:?}", drawing.report);
+        assert_eq!(text_of(&drawing.entities[0]).text, value);
+    }
 }

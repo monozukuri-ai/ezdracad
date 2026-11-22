@@ -12,6 +12,9 @@ Dedicated fixtures cover document policies, root primitives, numeric dimensions,
 of every kind the best-effort reader decodes in an older record generation, one
 of a kind it does not decode, and one that does not fit its layout.
 `best-effort25u` holds the same content in the Unicode record layout.
+`best-effort1` is a small drawing in the form of the first releases: shorter
+style tables, leftover bytes wherever nothing is stored, and a compound file
+without a class identifier.
 
 Construction code lives in `scripts/make_*_fixture.py` and
 `scripts/make_mps_fixtures.py`. MPX/MPS generators support `--check` to compare

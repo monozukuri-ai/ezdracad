@@ -28,11 +28,14 @@ __all__ = [
     "BestEffortLimits",
     "Block",
     "Color",
+    "DRAWING_PROPERTY_SET",
     "Diagnostic",
     "Drawing",
     "Entity",
     "Layer",
     "LineType",
+    "PAPER_NAMES",
+    "Property",
     "RGB_FILL_COLOR",
     "Report",
     "Settings",
@@ -51,6 +54,18 @@ BY_BLOCK_WIDTH = 18
 #: ``color`` of a fill that uses its own ``rgb`` value, or the background color.
 RGB_FILL_COLOR = 257
 BACKGROUND_FILL_COLOR = 258
+#: ``owner`` of the properties that hold the drawing's property set.
+DRAWING_PROPERTY_SET = "DRACAD_SYSTEM_DRAWING_PSET"
+#: Names the application prints for ``Settings.paper_type``.
+PAPER_NAMES = MappingProxyType(
+    {
+        0: "Free",
+        **{1 + size: f"A{size}" for size in range(7)},
+        **{8 + size: f"B{size}" for size in range(7)},
+        15: "Letter",
+        16: "Legal",
+    }
+)
 
 _DEFAULTS = _core.best_effort_limit_defaults()
 
@@ -123,10 +138,6 @@ class Entity:
     record_count: int
     data: Mapping[str, Any]
     children: tuple[Entity, ...]
-
-    @property
-    def hidden(self) -> bool:
-        return bool(self.flags & 0x02)
 
     @property
     def reversed(self) -> bool:
@@ -217,6 +228,45 @@ class Settings:
     drawing_scale: float
     paper_size: tuple[float, float]
     paper_origin: tuple[float, float]
+    #: Paper size code: 0 a free size, 1 to 7 A0 to A6, 8 to 14 B0 to B6,
+    #: 15 letter, 16 legal.
+    paper_type: int = 0
+    paper_portrait: bool = False
+    #: Factor between the paper scale and the scale the drawing states in its
+    #: scale field; 1 in most drawings.
+    scale_ratio: float = 1.0
+    comment: str = ""
+    #: Whether the drawing is printed with the pen width of each color
+    #: (``Color.pen_width``) instead of the width of each object.
+    width_by_color: bool = False
+
+    @property
+    def stated_scale(self) -> float:
+        """Denominator of the scale the drawing states in its scale field."""
+        return self.drawing_scale / self.scale_ratio
+
+    @property
+    def paper_name(self) -> str:
+        """Name of the paper size as the application prints it, ``""`` if unknown."""
+        return PAPER_NAMES.get(self.paper_type, "")
+
+
+@dataclass(frozen=True)
+class Property:
+    """A property saved with the drawing: no geometry, three strings.
+
+    The application keeps its own bookkeeping here. Properties whose owner is
+    ``DRAWING_PROPERTY_SET`` are the values that property-set fields print.
+    """
+
+    table: str
+    block_index: int | None
+    record_index: int
+    payload_offset: int
+    owner: str
+    name: str
+    value: str
+    lossy: bool
 
 
 @dataclass(frozen=True)
@@ -253,6 +303,8 @@ class Report:
     clamped_spans: int
     diagnostics: tuple[Diagnostic, ...]
     diagnostics_suppressed: int
+    #: Objects the application had erased; their records stay in the file.
+    erased_objects: int = 0
 
     def to_dict(self) -> dict:
         row = {field.name: getattr(self, field.name) for field in fields(self)}
@@ -287,11 +339,20 @@ class Drawing:
     blocks: tuple[Block, ...]
     entities: tuple[Entity, ...]
     report: Report
+    properties: tuple[Property, ...] = ()
 
     def walk(self) -> Iterator[Entity]:
         """Every entity of the drawing's own table, parents before members."""
         for entity in self.entities:
             yield from entity.walk()
+
+    def property_set(self) -> dict[str, str]:
+        """Values of the drawing's property set by name, as its fields print them."""
+        return {
+            item.name: item.value
+            for item in self.properties
+            if item.owner == DRAWING_PROPERTY_SET and item.table == "root"
+        }
 
     def block(self, name: str | bytes) -> Block | None:
         """The first definition with this name, or ``None``."""
@@ -312,11 +373,14 @@ class Drawing:
             "settings": None
             if self.settings is None
             else {
-                field.name: list(getattr(self.settings, field.name))
-                if field.name != "drawing_scale"
-                else self.settings.drawing_scale
+                field.name: list(value) if isinstance(value, tuple) else value
                 for field in fields(self.settings)
+                for value in (getattr(self.settings, field.name),)
             },
+            "properties": [
+                {field.name: getattr(item, field.name) for field in fields(item)}
+                for item in self.properties
+            ],
             "layers": [
                 {field.name: getattr(item, field.name) for field in fields(item)}
                 for item in self.layers
@@ -374,6 +438,11 @@ def _drawing(row: dict) -> Drawing:
             drawing_scale=settings["drawing_scale"],
             paper_size=tuple(settings["paper_size"]),
             paper_origin=tuple(settings["paper_origin"]),
+            paper_type=settings["paper_type"],
+            paper_portrait=settings["paper_portrait"],
+            scale_ratio=settings["scale_ratio"],
+            comment=settings["comment"],
+            width_by_color=settings["width_by_color"],
         ),
         layers=tuple(Layer(*item) for item in row["layers"]),
         colors=tuple(
@@ -406,7 +475,9 @@ def _drawing(row: dict) -> Drawing:
             clamped_spans=report["clamped_spans"],
             diagnostics=tuple(Diagnostic(**item) for item in report["diagnostics"]),
             diagnostics_suppressed=report["diagnostics_suppressed"],
+            erased_objects=report["erased_objects"],
         ),
+        properties=tuple(Property(**item) for item in row["properties"]),
     )
 
 

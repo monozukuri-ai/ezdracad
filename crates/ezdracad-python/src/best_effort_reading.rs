@@ -160,6 +160,7 @@ fn geometry_row<'py>(
             row.set_item("number", text.number)?;
             row.set_item("unit", text.unit_raw)?;
             row.set_item("item", text.item_raw)?;
+            row.set_item("output_size", text.output_size)?;
             row.set_item("format_codes", text.format_codes)?;
             row.set_item("lossy", text.lossy)?;
         }
@@ -203,6 +204,7 @@ fn geometry_row<'py>(
             reference_number,
             hole_count,
             link_id,
+            name,
         } => {
             row.set_item("polygon_kind", polygon_kind)?;
             row.set_item("flags", flags_raw)?;
@@ -210,13 +212,27 @@ fn geometry_row<'py>(
             row.set_item("reference_number", reference_number)?;
             row.set_item("hole_count", hole_count)?;
             row.set_item("region_id", link_id)?;
+            row.set_item("name", name)?;
         }
         BestEffortGeometry::Hatch {
             hatch_type,
             link_id,
             lines,
             pattern,
+            gradation,
         } => {
+            match gradation {
+                Some(gradation) => {
+                    let value = PyDict::new(py);
+                    value.set_item("start", gradation.start)?;
+                    value.set_item("end", gradation.end)?;
+                    value.set_item("rgb_start", gradation.rgb_start.map(u16::from).to_vec())?;
+                    value.set_item("rgb_end", gradation.rgb_end.map(u16::from).to_vec())?;
+                    value.set_item("gradation_type", gradation.gradation_type)?;
+                    row.set_item("gradation", value)?;
+                }
+                None => row.set_item("gradation", py.None())?,
+            }
             row.set_item("hatch_type", hatch_type)?;
             row.set_item("region_id", link_id)?;
             let lines: Vec<_> = lines
@@ -318,6 +334,7 @@ fn geometry_row<'py>(
             row.set_item("angle_degrees", angle_degrees)?;
             row.set_item("arrow_type", arrow_type)?;
             row.set_item("flags", flags_raw)?;
+            row.set_item("output_size", flags_raw & 0x80 != 0)?;
         }
         BestEffortGeometry::Image {
             file_name,
@@ -337,6 +354,7 @@ fn geometry_row<'py>(
             row.set_item("rotation_degrees", rotation_degrees)?;
         }
         BestEffortGeometry::ExternalReference {
+            symbol,
             file_name,
             directory,
             relative_directory,
@@ -345,6 +363,7 @@ fn geometry_row<'py>(
             scale,
             rotation_degrees,
         } => {
+            row.set_item("symbol", symbol)?;
             row.set_item("file_name", file_name)?;
             row.set_item("directory", directory)?;
             row.set_item("relative_directory", relative_directory)?;
@@ -352,6 +371,49 @@ fn geometry_row<'py>(
             row.set_item("elevation", elevation)?;
             row.set_item("scale", scale)?;
             row.set_item("rotation_degrees", rotation_degrees)?;
+        }
+        BestEffortGeometry::Layout {
+            number,
+            name,
+            paper_type,
+            paper_size,
+        } => {
+            row.set_item("number", number)?;
+            row.set_item("name", name)?;
+            row.set_item("paper_type", paper_type)?;
+            row.set_item("paper_size", paper_size)?;
+        }
+        BestEffortGeometry::Viewport {
+            flags_raw,
+            paper_point,
+            model_point,
+            scale,
+            rotation_degrees,
+            window,
+        } => {
+            row.set_item("flags", flags_raw)?;
+            row.set_item("paper_point", paper_point)?;
+            row.set_item("model_point", model_point)?;
+            row.set_item("scale", scale)?;
+            row.set_item("rotation_degrees", rotation_degrees)?;
+            match window {
+                Some([center, half_size]) => {
+                    row.set_item("center", center)?;
+                    row.set_item("half_size", half_size)?;
+                }
+                None => {
+                    row.set_item("center", py.None())?;
+                    row.set_item("half_size", py.None())?;
+                }
+            }
+        }
+        BestEffortGeometry::Polygon3D { hole_count } => {
+            row.set_item("hole_count", hole_count)?;
+        }
+        BestEffortGeometry::Camera { position, target }
+        | BestEffortGeometry::Light { position, target } => {
+            row.set_item("position", position)?;
+            row.set_item("target", target)?;
         }
     }
     Ok(row)
@@ -403,6 +465,11 @@ fn drawing_row<'py>(py: Python<'py>, drawing: &BestEffortDrawing) -> PyResult<Bo
             value.set_item("drawing_scale", settings.drawing_scale)?;
             value.set_item("paper_size", settings.paper_size)?;
             value.set_item("paper_origin", settings.paper_origin)?;
+            value.set_item("paper_type", settings.paper_type)?;
+            value.set_item("paper_portrait", settings.paper_portrait)?;
+            value.set_item("scale_ratio", settings.scale_ratio)?;
+            value.set_item("comment", &settings.comment)?;
+            value.set_item("width_by_color", settings.width_by_color)?;
             row.set_item("settings", value)?;
         }
         None => row.set_item("settings", py.None())?,
@@ -459,12 +526,26 @@ fn drawing_row<'py>(py: Python<'py>, drawing: &BestEffortDrawing) -> PyResult<Bo
     }
     row.set_item("blocks", blocks)?;
     row.set_item("entities", entity_rows(py, &drawing.entities)?)?;
+    let properties = PyList::empty(py);
+    for property in &drawing.properties {
+        let value = PyDict::new(py);
+        table_row(&value, Some(property.source.table))?;
+        value.set_item("record_index", property.source.record_index)?;
+        value.set_item("payload_offset", property.source.payload_offset)?;
+        value.set_item("owner", &property.owner)?;
+        value.set_item("name", &property.name)?;
+        value.set_item("value", &property.value)?;
+        value.set_item("lossy", property.lossy)?;
+        properties.append(value)?;
+    }
+    row.set_item("properties", properties)?;
     let report = PyDict::new(py);
     report.set_item("lossy", drawing.report.lossy())?;
     report.set_item("decoded_counts", &drawing.report.decoded_counts)?;
     report.set_item("unsupported_counts", &drawing.report.unsupported_counts)?;
     report.set_item("failed_counts", &drawing.report.failed_counts)?;
     report.set_item("property_records", drawing.report.property_records)?;
+    report.set_item("erased_objects", drawing.report.erased_objects)?;
     report.set_item("orphan_records", drawing.report.orphan_records)?;
     report.set_item("clamped_spans", drawing.report.clamped_spans)?;
     let diagnostics: Vec<_> = drawing
